@@ -23,7 +23,7 @@ If the work grows past these lines mid-flight, stop before committing, say what 
 
 ## Steps
 
-1. Arm the guard: through `{{SPADE_SHELL}}`, write `quick` to `.spade/guard/$CLAUDE_CODE_SESSION_ID/mode` before the first edit.
+1. Arm the guard: through `{{SPADE_SHELL}}`, write `quick` to `.spade/guard/$CLAUDE_CODE_SESSION_ID/mode` in the session repository for the folder you work in (`references/FRAMEWORK.md` § Mechanical guards, Markers) before the first edit.
    A guard deny is a halt: show its reason and tell the human the change needs `/spade`.
    Remove the marker when the PR is open or the halt is reported.
 2. Make the change on `spade-quick/<issue-id>-<slug>` (or `spade-quick/<slug>`) in one commit.

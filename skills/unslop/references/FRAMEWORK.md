@@ -122,7 +122,7 @@ The agent records it itself when guards are live (§ Mechanical guards), every r
 Otherwise the agent recommends a verdict and the human records it.
 Whoever records PASS moves the Scope to Done; PARTIAL, FAIL, or any unconfirmed row leaves it in Evaluating.
 
-When a verdict is recorded for a PR, by the agent or by the human through the agent, Evaluate writes `.spade/guard/reviewed-head-<pr>` as `<head sha> <VERDICT>` so the merge guard can check it.
+When a verdict is recorded for a PR, by the agent or by the human through the agent, Evaluate writes `.spade/guard/reviewed-head-<pr>` as `<head sha> <VERDICT>` in the session repository for the PR's working folder (§ Mechanical guards), so the merge guard can check it.
 
 The PR body is the durable record.
 After Evaluate, the agent adds the evaluation table, the verdict, and the finding dispositions to the PR body with `gh pr edit`, keeping every existing section, which does not move the head; an on-green merge passes that body as the squash message (a human merging by hand should do the same), so the record lands in git history.
@@ -197,7 +197,7 @@ Everything above still applies; this is what it adds.
 
 1. **Scope, Plan, review.** Author and lock the Scope, write the Plan, then run one `/spade-review` pass over Scope and Plan together. A blocking finding is tripwire 2.
 2. **Auto-approve.** Record `Approved by Deliver auto-approval, <date>` in the Plan with the review result and a one-line architecture check. This approves the Plan only. In `linear` mode post the Plan on the Scope issue and move it to Delivering.
-3. **Arm the guard.** If `.spade/guard/$CLAUDE_CODE_SESSION_ID/live` exists, guards are live. Write `deliver` to `.spade/guard/$CLAUDE_CODE_SESSION_ID/mode` and remove it on every exit (halt, abort, merge).
+3. **Arm the guard.** Check whether guards are live for the folder you deliver in (§ Mechanical guards, **Guards live or not**); that decides tripwire 6, who records the verdict, and the merge. Write `deliver` to `.spade/guard/$CLAUDE_CODE_SESSION_ID/mode` in that folder's session repository and remove it on every exit (halt, abort, merge).
 4. **Fix the base.** Record the exact base commit SHA the review range will start from.
 5. **Build.** Deliver the tasks (§ Deliver), checking tripwire 6 as the diff takes shape.
 6. **Open the PR.** Refuse to open one when the project already has `autonomy.deliver.max_open_prs` (default 3) open Deliver PRs; halt instead. The PR body leads with the approach, the rejected forks and why each lost, and the calls the agent made on its own, then **Risk** (what could break and who would notice), **How to revert** (the revert or flag that undoes it), and **Protected paths** (touched categories, or `none`). Apply `/unslop` to the title and body.
@@ -307,18 +307,51 @@ It never weighs a trade-off or reads the conversation.
 
 | Guard | Fires on | Denies when |
 |---|---|---|
-| Protected path | `Edit`, `Write`, `MultiEdit`, `NotebookEdit` | `.spade/guard/<session_id>/mode` exists. In `quick` mode any path matching the fourteen categories denies. In `deliver` mode only secrets and credentials, production data, and permission widening deny; permission widening covers `.spade/config`, `.claude/settings*.json`, `hooks/hooks.json`, `bin/spade-guard`, and any path whose purpose grants or widens a permission. |
-| Merge policy | `Bash` running `gh pr merge`, `glab mr merge`, or a `gh api` merge | `autonomy.deliver.merge` is `human` or absent. Under `on-green`, denies unless the PR is not a draft, is mergeable, has at least one check and every check is SUCCESS or SKIPPED, `.spade/guard/reviewed-head-<pr>` reads `<head sha> PASS` for the current head (or `PARTIAL`, when `autonomy.deliver.merge_partial` is true), and the command pins that head exactly once with `--match-head-commit` and a literal SHA and does not use `--admin`, `--repo`, `GH_REPO`, or a PR URL, and the merge floor (§ Ship and merge policy) passes over every changed file listed by `gh api .../pulls/<n>/files`, with the listed count equal to `changedFiles`. `glab` is not verified and denies under `on-green`. |
-| Stage all | `Bash` running `git add -A`, `--all`, or `.` | `guards.deny_stage_all: true`. Off by default. |
+| Protected path | `Edit`, `Write`, `MultiEdit`, `NotebookEdit` | A session repository's `.spade/guard/<session_id>/mode` exists, which arms that repository. An edit lexically outside an armed repository denies. Inside it, the path is classified relative to the armed repository and, when a deeper session repository holds the file, relative to that one too; either match denies. In `quick` mode any path matching the fourteen categories denies. In `deliver` mode only secrets and credentials, production data, and permission widening deny; permission widening covers `.spade/config`, `.claude/settings*.json`, `hooks/hooks.json`, `bin/spade-guard`, and any path whose purpose grants or widens a permission. |
+| Merge policy | `Bash` running `gh pr merge`, `glab mr merge`, or a `gh api` merge | The merge's working directory is unknown, or, when the session folder has no `.spade/config`, outside every session repository. Otherwise the target repository's `autonomy.deliver.merge` is `human` or absent. Under `on-green`, denies unless the PR is not a draft, is mergeable, has at least one check and every check is SUCCESS or SKIPPED, the target repository's `.spade/guard/reviewed-head-<pr>` reads `<head sha> PASS` for the current head (or `PARTIAL`, when `autonomy.deliver.merge_partial` is true), and the command pins that head exactly once with `--match-head-commit` and a literal SHA and does not use `--admin`, `--repo`, `GH_REPO`, or a PR URL, and the merge floor (§ Ship and merge policy) passes over every changed file listed by `gh api .../pulls/<n>/files`, with the listed count equal to `changedFiles`. Every `gh` call runs in the target repository. `glab` is not verified and denies under `on-green`. |
+| Stage all | `Bash` running `git add -A`, `--all`, or `.` | `guards.deny_stage_all: true` in the target repository's config. Off by default. |
 
-**Markers.** `SessionStart` writes `.spade/guard/<session_id>/live`; `SessionEnd` removes the session directory.
-`/spade` Deliver and `/spade-quick` write `.spade/guard/<session_id>/mode` at start and remove it at close, using `CLAUDE_CODE_SESSION_ID`.
+Every deny that depends on a config ends by naming it: `(read <path>/.spade/config)`.
+
+**Session repositories.** The first `SessionStart` of a session records which repositories count, in `.spade/guard/<session_id>/repos`:
+
+- the session folder (`CLAUDE_PROJECT_DIR`), when it holds `.spade/config`;
+- every child or grandchild folder that holds both `.git` (a directory, or a worktree's file) and `.spade/config`. Hidden folders such as `~/.spade` and folders without `.git`, such as test fixtures, are skipped.
+
+With a config at the session folder, the list and `live` go in its `.spade/guard/<session_id>/`.
+Without one, a copy of each goes in every recorded child, and nothing is written in the session folder.
+A folder with neither stays inert.
+Later `SessionStart` events (compact, resume, clear) leave an existing list alone, so a repository created or cloned mid-session, or a config an agent writes, never joins it; it counts from the next session.
+Copies of the list that disagree deny merges and armed edits.
+
+**Which repository a call targets.** The session repository for a path is the deepest recorded repository that contains it, compared lexically, without following symlinks.
+An edit targets its file.
+A Bash command targets its working directory: the hook input's `cwd`, moved by `cd [--|-L|-P] <literal path>` (`~` and `~/…` expand to `$HOME`) when that cd is joined to the next command by `&&` and every later command up to the checked one is joined by `&&` or `|`, and for stage-all by `git -C <literal path>`.
+A newline ends a command the way `;` does.
+Anything else that can change the directory makes it unknown: a cd joined any other way or to a path that is not literal, `cd -`, `pushd`, `popd`, `builtin cd`, `command cd`, `eval`, `source`, `env -C`, a `CDPATH` assignment, and any subshell, backtick, or command substitution before the checked command; for stage-all also `--git-dir`, `--work-tree`, `GIT_DIR`, and `GIT_WORK_TREE`.
+An unknown directory denies a merge.
+When the target is outside every session repository, or is an unknown stage-all, the session folder's config applies if it has one.
+Without one, such a merge denies, a stage-all in an unknown directory denies when any session repository sets `deny_stage_all`, and a stage-all outside every session repository is not checked.
+
+**Markers.** `SessionStart` writes `live` and `repos` as above; `SessionEnd` removes the session directory everywhere it was written.
+`/spade` Deliver and `/spade-quick` write `mode` in `.spade/guard/<session_id>/` of the session repository for the folder they deliver in, at start, and remove it at close, using `CLAUDE_CODE_SESSION_ID`.
+The session repository for a folder is the deepest repository in the recorded list that contains it; with none, there is nothing to arm.
+A `mode` file anywhere else is ignored.
+`/spade-evaluate` writes `reviewed-head-<pr>` in `.spade/guard/` of the session repository for the PR's working folder, which is where the merge guard reads it.
 `.spade/guard/` is gitignored.
 A missing marker means guards are inert, never that something is allowed.
 
-**Guards live or not.** Guards are live when `.spade/guard/<session_id>/live` exists.
-Only then do the lighter rules apply: the narrowed tripwire 6, the agent-recorded Evaluate verdict, and merge under `on-green`.
-Without it (Codex, a Claude session without the hooks, or a repository without `.spade/config`), any security category halts before code and the human merges.
+**Guards live or not.** Guards are live for a folder when the nearest folder at or above it that holds `.git` or `.spade/config` is named in the session's recorded list, the nearest `.spade/guard/<session_id>/repos` at or above it:
+
+```sh
+d=$PWD; while [ ! -e "$d/.git" ] && [ ! -f "$d/.spade/config" ] && [ "$d" != / ]; do d=$(dirname "$d"); done
+l=$d; while [ ! -f "$l/.spade/guard/$CLAUDE_CODE_SESSION_ID/repos" ] && [ "$l" != / ]; do l=$(dirname "$l"); done
+grep -qxF "$d" "$l/.spade/guard/$CLAUDE_CODE_SESSION_ID/repos" 2>/dev/null
+```
+
+A worktree or clone added mid-session has its own `.git` and is not listed, so guards are not live there until the next session, even inside a listed repository such as `.claude/worktrees/<name>`; the guard still judges its edits as part of the repository around it.
+Only when guards are live do the lighter rules apply: the narrowed tripwire 6, the agent-recorded Evaluate verdict, and merge under `on-green`.
+Otherwise (Codex, a Claude session without the hooks, a repository without `.spade/config`, or one added mid-session), any security category halts before code and the human merges.
 
 **A deny is a halt.** Tell the human the reason and wait.
 Do not remove a marker, edit the guard or the config, or reach the same file another way.
@@ -329,6 +362,7 @@ Paths are split into words at non-alphanumeric and camelCase boundaries and matc
 `key` counts as a credential only beside a credential word such as `api`, `private`, or `ssh`.
 Well-known credential files (`id_rsa`, `authorized_keys`, `.npmrc`, `.netrc`, `kubeconfig`) are named directly.
 A check that needs a literal value, such as the merge head pin, fails rather than trusting a command substitution.
+The working directory starts from the `cwd` Claude Code reports; `cd <literal path> &&` in front of a merge works whatever that is.
 
 **The framework's own layout.** `src/`, `skills/`, `agents/`, `plugins/`, `fragments/`, `hooks/`, `bin/`, `setup`, and the generated host trees are governance surfaces only inside this repository (detected by `src/CAPABILITIES.md` and `src/skills/` both existing).
 In a consumer repository `src/` is application code.

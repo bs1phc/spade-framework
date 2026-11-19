@@ -796,6 +796,7 @@ guard_stage_all() {
                     while IFS= read -r stage_repo; do
                         [ -n "$stage_repo" ] || continue
                         config="$stage_repo/.spade/config"
+                        deny_suffix=" (read $config)"
                         is_true "$(config_value guards.deny_stage_all)" \
                             && deny "SPADE guard: git add -A, --all, and git add . are disabled in $stage_repo (guards.deny_stage_all), and this command's working directory is unknown (${target#*"$tab"}). Stage the exact paths you changed."
                     done <<EOF
@@ -813,6 +814,7 @@ EOF
                 fi ;;
         esac
         config="$stage_repo/.spade/config"
+        deny_suffix=" (read $config)"
         is_true "$(config_value guards.deny_stage_all)" \
             && deny "SPADE guard: git add -A, --all, and git add . are disabled in this repository (guards.deny_stage_all). Stage the exact paths you changed."
     done <<EOF
@@ -921,6 +923,8 @@ guard_merge() {
         repo="$project_dir"
     fi
     config="$repo/.spade/config"
+    # Every deny from here on depends on this config, so it names it.
+    deny_suffix=" (read $config)"
     policy=$(config_value autonomy.deliver.merge)
     case "$policy" in
         on-green) ;;

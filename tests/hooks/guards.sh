@@ -779,6 +779,82 @@ expect_allow "decoy mode in a fixture without .git is ignored" "$(edit_at "$pn" 
 expect_allow "mode in a repository created mid-session is ignored" "$(edit_at "$pn" "$pn/d/src/auth/login.ts")"
 rm -rf "$project/sub" "$pn/.spade" "$pn/c/.spade/guard" "$pn/d/.spade/guard"
 
+# Every deny that depends on a config names the config it read (PS-3283).
+expect_deny_reason "names the child's config, human policy" "(read $og/legacy/.spade/config)" "$(green_merge "$og" "cd legacy && gh pr merge 41 $pin")"
+expect_deny_reason "names the session folder's config, human policy" "(read $rs/.spade/config)" "$(green_merge "$rs" "gh pr merge 41 $pin")"
+expect_deny_reason "names the child's config, failing check" "(read $ac2/svc/.spade/config)" "$(green_merge "$ac2" "cd svc && gh pr merge 41 $pin" "$failing")"
+printf 'abc123 PARTIAL\n' > "$ac2/svc/.spade/guard/reviewed-head-41"
+expect_deny_reason "names the child's config, PARTIAL without merge_partial" "merge_partial is true in .spade/config. (read $ac2/svc/.spade/config)" "$(green_merge "$ac2" "cd svc && gh pr merge 41 $pin")"
+printf 'abc123 PASS\n' > "$ac2/svc/.spade/guard/reviewed-head-41"
+expect_deny_reason "names the child's config, merge floor" "(read $rs/web/.spade/config)" "$(GH_STUB_FILES='[{"filename":".github/workflows/ci.yml","patch":"+x"}]' green_merge "$rs" "cd web && gh pr merge 41 $pin")"
+expect_deny_reason "names the child's config, stage-all" "(read $rs/web/.spade/config)" "$(run_bash "$rs" "cd web && git add -A")"
+expect_deny_reason "names the child's config, stage-all in an unknown directory" "(read $pn/b/.spade/config)" "$(run_bash "$pn" "git --git-dir x/.git add -A")"
+write_config on-green true
+expect_deny_reason "names the project's config, single-repository stage-all" "(read $project/.spade/config)" "$(run_bash "$project" "git add -A")"
+write_config on-green false
+
+# Skills decide whether guards are live, and where reviewed-head goes, from
+# the same recorded list (docs/FRAMEWORK.md § Mechanical guards). These
+# helpers follow that rule as written, against what SessionStart recorded.
+recorded_list() {
+    # Arguments: folder. Prints the nearest .spade/guard/<session>/repos at or above it.
+    d="$1"
+    while :; do
+        [ -f "$d/.spade/guard/$session/repos" ] && { printf '%s\n' "$d/.spade/guard/$session/repos"; return 0; }
+        [ "$d" != / ] && [ -n "$d" ] || return 1
+        d=$(dirname "$d")
+    done
+}
+skill_live() {
+    # Arguments: folder. Succeeds when the nearest folder at or above it that
+    # holds .git or .spade/config is itself in the recorded list.
+    d="$1"
+    while [ ! -e "$d/.git" ] && [ ! -f "$d/.spade/config" ]; do
+        [ "$d" != / ] || return 1
+        d=$(dirname "$d")
+    done
+    list=$(recorded_list "$d") || return 1
+    grep -qxF "$d" "$list"
+}
+skill_not_live() { ! skill_live "$1"; }
+session_repo_for() {
+    # Arguments: folder. Prints the deepest recorded repository that holds it.
+    list=$(recorded_list "$1") || return 1
+    best=""
+    while IFS= read -r r; do
+        case "$1" in "$r"|"$r"/*) [ "${#r}" -gt "${#best}" ] && best="$r" ;; esac
+    done < "$list"
+    printf '%s\n' "$best"
+}
+check "live: a listed child under a parent with a config" skill_live "$pc/web"
+check "live: a folder inside a listed child" skill_live "$pc/web/src/app"
+check "live: a listed child under a parent without a config" skill_live "$pn/a"
+check "live: the parent with a config itself" skill_live "$pc"
+check "not live: a repository created mid-session under a parent with a config" skill_not_live "$pc/late"
+make_repo "$pc/.claude/worktrees/x" on-green false file
+check "not live: a worktree added mid-session under .claude/worktrees" skill_not_live "$pc/.claude/worktrees/x"
+check "not live: a folder inside that worktree" skill_not_live "$pc/.claude/worktrees/x/src"
+make_repo "$project/.claude/worktrees/x" on-green false file
+check "not live: an in-repo .claude/worktrees/x in a single repository" skill_not_live "$project/.claude/worktrees/x"
+set_mode deliver
+expect_deny "the guard still judges an in-repo worktree's edits as part of the project" "$(edit_at "$project" "$project/.claude/worktrees/x/.claude/settings.json")"
+clear_mode
+rm -rf "$project/.claude"
+
+# A session folder below its git top level: the folder is live, and
+# reviewed-head goes in it, where the guard reads it.
+mono="$tmp/mono"
+mkdir -p "$mono/.git"
+make_repo "$mono/sub" on-green false none
+guard_at "$mono/sub" "$(session_event SessionStart)" >/dev/null
+check "live: a session folder below its git top level" skill_live "$mono/sub"
+check "live: a folder inside that session folder" skill_live "$mono/sub/pkg"
+check "not live: the git top level above the session folder" skill_not_live "$mono"
+check "reviewed-head location: the session folder, not the git top level" test "$(session_repo_for "$mono/sub/pkg")" = "$mono/sub"
+printf 'abc123 PASS\n' > "$(session_repo_for "$mono/sub/pkg")/.spade/guard/reviewed-head-41"
+expect_allow "the guard reads reviewed-head where the skill rule wrote it" "$(green_merge "$mono/sub" "gh pr merge 41 $pin" "$green" )"
+check "reviewed-head location: a listed child for a merge run in it" test "$(session_repo_for "$pn/a/src")" = "$pn/a"
+
 # SessionEnd removes the session's markers wherever they were written.
 guard_at "$pn" "$(session_event SessionEnd)" >/dev/null
 check "parent without a config, SessionEnd removes every child's markers" absent "$pn/a/.spade/guard/$session" "$pn/b/.spade/guard/$session"
