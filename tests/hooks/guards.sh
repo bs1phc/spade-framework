@@ -864,6 +864,18 @@ check "reviewed-head location: a listed child for a merge run in it" test "$(ses
 # form it must leave alone.
 echo "delivery review findings"
 
+expect_deny_without() {
+    # Arguments: label, text the reason must contain, text it must not
+    # contain, output. Passes when the output is a deny whose reason contains
+    # the first text and not the second.
+    if printf '%s' "$4" | jq -e --arg want "$2" --arg not "$3" '.hookSpecificOutput.permissionDecision == "deny" and (.hookSpecificOutput.permissionDecisionReason | contains($want) and (contains($not) | not))' >/dev/null 2>&1; then
+        echo "  ok:   deny  $1"
+    else
+        echo "  FAIL: expected deny for $1 with '$2' and without '$3', got: ${4:-<empty>}"
+        fail=$((fail + 1))
+    fi
+}
+
 # A cd inside a shell comment never moves the directory. The session folder
 # is human with deny_stage_all; the recorded child is on-green without it.
 cm="$tmp/cm"
@@ -918,6 +930,17 @@ expect_allow "single repository, unknown directory, merge" "$(green_merge "$proj
 check "single repository, unknown directory, gh ran in the project" only_ran_in "$project"
 expect_allow "single repository, a command before the merge" "$(green_merge "$project" "git fetch origin && gh pr merge 41 $pin")"
 expect_allow "single repository, a comment before the merge" "$(green_merge "$project" "# note; cd x &&${nl}gh pr merge 41 $pin")"
+
+# A deny names only a config it used: a stage-all check that read a config
+# and passed leaves no suffix on a later merge deny.
+pz="$tmp/pz"
+make_repo "$pz/a" on-green false
+make_repo "$pz/b" on-green false
+guard_at "$pz" "$(session_event SessionStart)" >/dev/null
+expect_deny_without "no stale config name after an unknown stage-all" "working directory is unknown" "(read" "$(run_bash "$pz" 'git -C "$x" add -A; gh pr merge 5')"
+expect_deny_without "no stale config name after a known stage-all" "working directory is unknown" "(read" "$(run_bash "$pz" 'git add -A && cd "$x" && gh pr merge 5' "$pz/a")"
+expect_deny_without "no config name on an outside-the-repositories deny" "outside every repository" "(read" "$(run_bash "$pz" 'gh pr merge 5; git -C a add -A')"
+expect_deny_reason "a deny that reads a config still names it" "(read $pz/a/.spade/config)" "$(green_merge "$pz" "cd a && gh pr merge 5 --match-head-commit abc123")"
 
 # Path normalisation never glob-expands a component against the guard's cwd.
 mkdir -p "$tmp/globcwd/a" "$tmp/globcwd/b"

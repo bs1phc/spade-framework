@@ -859,6 +859,8 @@ EOF
     done <<EOF
 $targets
 EOF
+    # Every config read above passed, so a later deny must not name one.
+    deny_suffix=""
     return 0
 }
 
@@ -944,6 +946,8 @@ EOF
 }
 
 guard_merge() {
+    # A deny names only a config this check read, never one an earlier check left behind.
+    deny_suffix=""
     merges=$(printf '%s' "$segments" | merge_segment)
     [ -n "$merges" ] || return 0
     merge=$(printf '%s\n' "$merges" | head -n 1)
