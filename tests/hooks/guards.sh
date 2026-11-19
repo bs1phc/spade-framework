@@ -516,6 +516,117 @@ nojq_out=$(printf '%s' "$(pre_tool Bash '{"command":"git add -A"}')" | CLAUDE_PR
     && [ -z "$nojq_out" ] && echo "  ok:   parent without a config, missing jq is inert" \
     || { echo "  FAIL: parent without a config, missing jq should be inert, got: $nojq_out"; fail=$((fail + 1)); }
 
+# Working directory. A second gh stub records the folder each gh call ran in,
+# then hands over to the stub above.
+pwd_stubs="$tmp/pwd-stubs"
+gh_log="$tmp/gh-pwd.log"
+mkdir -p "$pwd_stubs"
+cat > "$pwd_stubs/gh" <<EOF
+#!/usr/bin/env bash
+printf '%s\n' "\$PWD" >> "$gh_log"
+exec "$stubs/gh" "\$@"
+EOF
+chmod +x "$pwd_stubs/gh"
+
+bash_event() {
+    # Arguments: command, optional hook cwd. Prints a Bash PreToolUse event.
+    jq -cn --arg c "$1" --arg cwd "${2:-}" --arg s "$session" \
+        '{hook_event_name:"PreToolUse", session_id:$s, tool_name:"Bash", tool_input:{command:$c}} + (if $cwd == "" then {} else {cwd:$cwd} end)'
+}
+
+run_bash() {
+    # Arguments: session folder, command, optional hook cwd. Prints the
+    # guard's decision, with gh calls recorded in gh_log.
+    : > "$gh_log"
+    bash_event "$2" "${3:-}" | CLAUDE_PROJECT_DIR="$1" HOME="${STUB_HOME:-$HOME}" PATH="$pwd_stubs:$stubs:$PATH" "$GUARD"
+}
+
+gh_ran_in() {
+    # Arguments: session folder, command, optional hook cwd. Prints the
+    # folder the first gh call ran in, or "gh never ran: <decision>".
+    decision=$(run_bash "$@")
+    if [ -s "$gh_log" ]; then head -n 1 "$gh_log"; else printf 'gh never ran: %s' "${decision:-allow}"; fi
+}
+
+expect_ran_in() {
+    # Arguments: label, expected folder, actual. Passes on an exact match.
+    if [ "$3" = "$2" ]; then echo "  ok:   ran in ${2#"$tmp"/}  $1"
+    else echo "  FAIL: $1: expected gh to run in $2, got: $3"; fail=$((fail + 1)); fi
+}
+
+# A session folder with a config (merge: human) and child repositories on
+# on-green, so gh runs only when the merge resolves to a child.
+rs="$tmp/rs"
+make_repo "$rs" human false none
+make_repo "$rs/web" on-green true
+make_repo "$rs/web/ui" on-green false
+make_repo "$rs/api" on-green false
+guard_at "$rs" "$(session_event SessionStart)" >/dev/null
+pin="--squash --match-head-commit abc123"
+
+# The everyday forms resolve to the repository they name.
+expect_ran_in "cd child && merge" "$rs/web" "$(gh_ran_in "$rs" "cd web && gh pr merge 41 $pin")"
+expect_ran_in "the deepest recorded repository wins" "$rs/web/ui" "$(gh_ran_in "$rs" "cd web/ui && gh pr merge 41 $pin")"
+expect_ran_in "a folder inside a child resolves to the child" "$rs/web" "$(gh_ran_in "$rs" "cd web/src/deep && gh pr merge 41 $pin")"
+expect_ran_in "absolute cd" "$rs/api" "$(gh_ran_in "$rs" "cd $rs/api && gh pr merge 41 $pin")"
+expect_ran_in "hook cwd in a child" "$rs/api" "$(gh_ran_in "$rs" "gh pr merge 41 $pin" "$rs/api")"
+expect_ran_in "relative cd from the hook cwd" "$rs/api" "$(gh_ran_in "$rs" "cd ../api && gh pr merge 41 $pin" "$rs/web")"
+expect_ran_in "cd --" "$rs/web" "$(gh_ran_in "$rs" "cd -- web && gh pr merge 41 $pin")"
+expect_ran_in "cd -P" "$rs/web" "$(gh_ran_in "$rs" "cd -P web && gh pr merge 41 $pin")"
+expect_ran_in "cd -L" "$rs/api" "$(gh_ran_in "$rs" "cd -L api && gh pr merge 41 $pin")"
+expect_ran_in "cd ~" "$rs/web" "$(STUB_HOME="$rs/web" gh_ran_in "$rs" "cd ~ && gh pr merge 41 $pin")"
+expect_ran_in "cd ~/path" "$rs/web/ui" "$(STUB_HOME="$rs/web" gh_ran_in "$rs" "cd ~/ui && gh pr merge 41 $pin")"
+expect_ran_in "two cds joined by &&" "$rs/web/ui" "$(gh_ran_in "$rs" "cd web && cd ui && gh pr merge 41 $pin")"
+expect_ran_in "a command between the cd and the merge" "$rs/web" "$(gh_ran_in "$rs" "cd web && git fetch origin && gh pr merge 41 $pin")"
+expect_ran_in "a pipe into the merge after the cd" "$rs/web" "$(gh_ran_in "$rs" "cd web && echo y | gh pr merge 41 $pin")"
+expect_ran_in "a line continuation after &&" "$rs/web" "$(gh_ran_in "$rs" "cd web && \\${nl}gh pr merge 41 $pin")"
+expect_ran_in "a newline after &&" "$rs/web" "$(gh_ran_in "$rs" "cd web &&${nl}gh pr merge 41 $pin")"
+expect_deny_reason "no cd, the session folder's policy" "merge policy is 'human'" "$(run_bash "$rs" "gh pr merge 41 $pin")"
+
+# Every form the guard does not model makes the directory unknown, and the merge denies.
+for unknown_form in "cd web; gh pr merge 41 $pin" \
+                    "cd web${nl}gh pr merge 41 $pin" \
+                    "cd web || true && gh pr merge 41 $pin" \
+                    "true || cd web && gh pr merge 41 $pin" \
+                    "ls | cd web && gh pr merge 41 $pin" \
+                    "cd web && false || gh pr merge 41 $pin" \
+                    "cd web & gh pr merge 41 $pin" \
+                    'cd "$D" && gh pr merge 41 --squash --match-head-commit abc123' \
+                    'cd $(echo web) && gh pr merge 41 --squash --match-head-commit abc123' \
+                    'cd `echo web` && gh pr merge 41 --squash --match-head-commit abc123' \
+                    "cd - && gh pr merge 41 $pin" \
+                    "cd ~bob && gh pr merge 41 $pin" \
+                    "cd web/* && gh pr merge 41 $pin" \
+                    "cd && gh pr merge 41 $pin" \
+                    "cd web ui && gh pr merge 41 $pin" \
+                    "pushd web && gh pr merge 41 $pin" \
+                    "popd && gh pr merge 41 $pin" \
+                    "builtin cd web && gh pr merge 41 $pin" \
+                    "command cd web && gh pr merge 41 $pin" \
+                    "{ cd web; } && gh pr merge 41 $pin" \
+                    "eval \"cd web\" && gh pr merge 41 $pin" \
+                    "source ./go.sh && gh pr merge 41 $pin" \
+                    "env -C web gh pr merge 41 $pin" \
+                    "CDPATH=$rs cd web && gh pr merge 41 $pin" \
+                    "cd $rs/api && (cd $rs/web && true) && gh pr merge 41 $pin" \
+                    'x=$(cd web && pwd) && gh pr merge 41 --squash --match-head-commit abc123' \
+                    'echo $(cd web && gh pr merge 41 --squash --match-head-commit abc123)'; do
+    expect_deny_reason "unknown directory: $(printf '%s' "$unknown_form" | tr '\n' '~')" "working directory is unknown" "$(run_bash "$rs" "$unknown_form")"
+done
+
+# Stage-all reads the config of the repository it runs in, including git -C.
+# Only web sets deny_stage_all.
+expect_allow "stage-all in the session folder" "$(run_bash "$rs" "git add -A")"
+expect_deny "stage-all after cd child" "$(run_bash "$rs" "cd web && git add -A")"
+expect_deny "stage-all from a hook cwd in the child" "$(run_bash "$rs" "git add -A" "$rs/web")"
+expect_deny "stage-all with git -C child" "$(run_bash "$rs" "git -C web add -A")"
+expect_allow "stage-all with git -C another child" "$(run_bash "$rs" "git -C api add -A")"
+expect_allow "stage-all with git -C relative to a cd" "$(run_bash "$rs" "cd web && git -C ../api add -A")"
+expect_allow "stage-all in the deepest repository" "$(run_bash "$rs" "cd web/ui && git add -A")"
+expect_deny "stage-all with git -C back up to its parent" "$(run_bash "$rs" "cd web/ui && git -C .. add -A")"
+expect_deny "the second of two stage-alls" "$(run_bash "$rs" "cd api && git add -A && cd ../web && git add --all")"
+expect_allow "stage-all with an unreadable git -C, judged by the session folder" "$(run_bash "$rs" 'git -C "$X" add -A')"
+
 # SessionEnd removes the session's markers wherever they were written.
 guard_at "$pn" "$(session_event SessionEnd)" >/dev/null
 check "parent without a config, SessionEnd removes every child's markers" absent "$pn/a/.spade/guard/$session" "$pn/b/.spade/guard/$session"
