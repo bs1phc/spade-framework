@@ -753,11 +753,30 @@ guard_stage_all() {
         [ -n "$target" ] || continue
         case "$target" in
             "?"*)
-                # An unknown directory is judged by the session folder's config.
-                stage_repo="$project_dir" ;;
+                # An unknown directory is judged by the session folder's
+                # config, as before. Without one, it denies when any session
+                # repository sets deny_stage_all.
+                if [ "$root_config" = yes ]; then
+                    stage_repo="$project_dir"
+                else
+                    while IFS= read -r stage_repo; do
+                        [ -n "$stage_repo" ] || continue
+                        config="$stage_repo/.spade/config"
+                        is_true "$(config_value guards.deny_stage_all)" \
+                            && deny "SPADE guard: git add -A, --all, and git add . are disabled in $stage_repo (guards.deny_stage_all), and this command's working directory is unknown (${target#*"$tab"}). Stage the exact paths you changed."
+                    done <<EOF
+$repos
+EOF
+                    continue
+                fi ;;
             *)
                 stage_repo=$(repo_for "$target")
-                [ -n "$stage_repo" ] || stage_repo="$project_dir" ;;
+                if [ -z "$stage_repo" ]; then
+                    # Outside every recorded repository: the session folder's
+                    # config when there is one, else no stage-all rule applies.
+                    [ "$root_config" = yes ] || continue
+                    stage_repo="$project_dir"
+                fi ;;
         esac
         config="$stage_repo/.spade/config"
         is_true "$(config_value guards.deny_stage_all)" \
@@ -860,7 +879,13 @@ guard_merge() {
         "?"*) deny "SPADE guard: this merge's working directory is unknown (${target#*"$tab"}), so the guard cannot tell which repository's policy applies. Run it as gh pr merge on its own, or after cd <literal path> &&." ;;
     esac
     repo=$(repo_for "$target")
-    [ -n "$repo" ] || repo="$project_dir"
+    if [ -z "$repo" ]; then
+        # Outside every recorded repository: the session folder's config
+        # still governs, as it did before, when there is one.
+        [ "$root_config" = yes ] \
+            || deny "SPADE guard: this merge runs in $target, outside every repository recorded for this session (.spade/guard/$sid/repos), so no merge policy covers it. A human merges it, or the merge runs from a recorded repository."
+        repo="$project_dir"
+    fi
     config="$repo/.spade/config"
     policy=$(config_value autonomy.deliver.merge)
     case "$policy" in
@@ -885,8 +910,8 @@ guard_merge() {
     [ "$is_draft" = false ] || deny "SPADE guard: PR $number is a draft. Drafts are never merged unattended."
     [ "$mergeable" = MERGEABLE ] || deny "SPADE guard: PR $number reports mergeable=$mergeable. Only MERGEABLE merges."
     rollup_green "$view" || deny "SPADE guard: PR $number has no checks or a check that is not SUCCESS or SKIPPED. On-green needs at least one green check and no other state."
-    reviewed_file="$guard_dir/reviewed-head-$number"
-    [ -f "$reviewed_file" ] || deny "SPADE guard: no recorded Evaluate for PR $number (.spade/guard/reviewed-head-$number). Run the two-axis Delivery Review and Evaluate on the current head first."
+    reviewed_file="$repo/.spade/guard/reviewed-head-$number"
+    [ -f "$reviewed_file" ] || deny "SPADE guard: no recorded Evaluate for PR $number ($reviewed_file). Run the two-axis Delivery Review and Evaluate on the current head first."
     reviewed=$(head -n 1 "$reviewed_file" | awk '{print $1}')
     verdict=$(head -n 1 "$reviewed_file" | awk '{print toupper($2)}')
     [ "$reviewed" = "$head_sha" ] || deny "SPADE guard: PR $number head $head_sha differs from the reviewed head $reviewed. Rerun Delivery Review and Evaluate on the new head."
@@ -948,11 +973,9 @@ EOF
             ;;
     esac
 fi
-[ "$root_config" = yes ] || exit 0
-
 case "$tool" in
     Edit|Write|MultiEdit|NotebookEdit)
-        guard_protected_path ;;
+        [ "$root_config" = yes ] && guard_protected_path ;;
     Bash)
         command=$(printf '%s' "$input" | jq -r '.tool_input.command // ""')
         segments=$(printf '%s' "$command" | normalized_segments)

@@ -627,6 +627,90 @@ expect_deny "stage-all with git -C back up to its parent" "$(run_bash "$rs" "cd 
 expect_deny "the second of two stage-alls" "$(run_bash "$rs" "cd api && git add -A && cd ../web && git add --all")"
 expect_allow "stage-all with an unreadable git -C, judged by the session folder" "$(run_bash "$rs" 'git -C "$X" add -A')"
 
+# Merges are judged by the repository they run in.
+only_ran_in() {
+    # Arguments: folder. Succeeds when gh ran at least once and every call ran there.
+    [ -s "$gh_log" ] && [ "$(sort -u "$gh_log")" = "$1" ]
+}
+green_merge() {
+    # Arguments: session folder, command, optional view JSON. Prints the
+    # guard's decision with gh reporting the given PR state (default green).
+    GH_STUB_VIEW="${3:-$green}" run_bash "$1" "$2"
+}
+failing='{"isDraft":false,"mergeable":"MERGEABLE","headRefOid":"abc123","changedFiles":1,"statusCheckRollup":[{"conclusion":"FAILURE"}]}'
+
+# AC 2: a parent session with no merge policy merges a child PR under the
+# child's on-green rules, and gh runs in the child.
+ac2="$tmp/ac2"
+make_repo "$ac2" none false none
+make_repo "$ac2/svc" on-green false
+guard_at "$ac2" "$(session_event SessionStart)" >/dev/null
+expect_deny_reason "parent with no merge policy, child with no recorded Evaluate" "no recorded Evaluate for PR 41 ($ac2/svc/.spade/guard/reviewed-head-41)" "$(green_merge "$ac2" "cd svc && gh pr merge 41 $pin")"
+check "parent with no merge policy, the denied check ran gh in the child" only_ran_in "$ac2/svc"
+printf 'abc123 PASS\n' > "$ac2/.spade/guard/reviewed-head-41"
+expect_deny_reason "a reviewed head recorded in the parent does not count for the child" "no recorded Evaluate" "$(green_merge "$ac2" "cd svc && gh pr merge 41 $pin")"
+mkdir -p "$ac2/svc/.spade/guard"
+printf 'abc123 PASS\n' > "$ac2/svc/.spade/guard/reviewed-head-41"
+expect_allow "parent with no merge policy, child on-green, every condition holds" "$(green_merge "$ac2" "cd svc && gh pr merge 41 $pin")"
+check "parent with no merge policy, every gh call ran in the child" only_ran_in "$ac2/svc"
+expect_deny_reason "parent with no merge policy, child on-green, failing check" "has no checks or a check that is not SUCCESS" "$(green_merge "$ac2" "cd svc && gh pr merge 41 $pin" "$failing")"
+expect_deny_reason "parent with no merge policy, child on-green, unpinned" "pin the merge exactly once" "$(green_merge "$ac2" "cd svc && gh pr merge 41 --squash")"
+expect_deny_reason "parent with no merge policy, the parent's own merge" "merge policy is 'human'" "$(green_merge "$ac2" "gh pr merge 41 $pin")"
+
+# The same from a parent without any config.
+printf 'abc123 PASS\n' > "$pn/a/.spade/guard/reviewed-head-41"
+expect_allow "parent without a config, child on-green, every condition holds" "$(green_merge "$pn" "cd a && gh pr merge 41 $pin")"
+check "parent without a config, every gh call ran in the child" only_ran_in "$pn/a"
+expect_deny_reason "parent without a config, child under human" "merge policy is 'human'" "$(green_merge "$pn" "cd b && gh pr merge 41 $pin")"
+
+# PS-3283, both directions: the child's policy decides, not the session folder's.
+mkdir -p "$rs/web/.spade/guard"
+printf 'abc123 PASS\n' > "$rs/web/.spade/guard/reviewed-head-41"
+expect_allow "PS-3283, human parent, on-green child merges" "$(green_merge "$rs" "cd web && gh pr merge 41 $pin")"
+check "PS-3283, human parent, gh ran in the child" only_ran_in "$rs/web"
+og="$tmp/og"
+make_repo "$og" on-green false none
+make_repo "$og/legacy" human false
+guard_at "$og" "$(session_event SessionStart)" >/dev/null
+printf 'abc123 PASS\n' > "$og/.spade/guard/reviewed-head-41"
+mkdir -p "$og/legacy/.spade/guard"
+printf 'abc123 PASS\n' > "$og/legacy/.spade/guard/reviewed-head-41"
+expect_deny_reason "PS-3283, on-green parent, human child denies" "merge policy is 'human'" "$(green_merge "$og" "cd legacy && gh pr merge 41 $pin")"
+check "PS-3283, on-green parent, gh never ran for the human child" test ! -s "$gh_log"
+expect_allow "PS-3283, on-green parent, its own merge still merges" "$(green_merge "$og" "gh pr merge 41 $pin")"
+check "PS-3283, on-green parent, its own merge ran gh in the parent" only_ran_in "$og"
+
+# Cross-repository merges stay closed from a child too.
+for elsewhere_form in "cd web && gh pr merge 41 -R other/repo $pin" \
+                      "cd web && gh pr merge 41 --repo other/repo $pin" \
+                      "cd web && gh pr merge 41 --repo=other/repo $pin" \
+                      "cd web && GH_REPO=other/repo gh pr merge 41 $pin" \
+                      "cd web && gh pr merge https://github.com/other/repo/pull/41 $pin"; do
+    expect_deny_reason "on-green child, $elsewhere_form" "drop -R, --repo, GH_REPO, or a PR URL" "$(green_merge "$rs" "$elsewhere_form")"
+done
+
+# Unknown and outside: a session folder without a config has no policy to fall back on.
+expect_deny_reason "parent without a config, unknown directory" "working directory is unknown" "$(green_merge "$pn" 'cd "$X" && gh pr merge 41 --squash --match-head-commit abc123')"
+expect_deny_reason "parent without a config, merge in the session folder itself" "outside every repository recorded for this session" "$(green_merge "$pn" "gh pr merge 41 $pin")"
+expect_deny_reason "parent without a config, merge after cd /tmp" "outside every repository recorded for this session" "$(green_merge "$pn" "cd /tmp && gh pr merge 41 $pin")"
+expect_deny_reason "parent without a config, merge in a repository created mid-session" "outside every repository recorded for this session" "$(green_merge "$pn" "cd d && gh pr merge 41 $pin")"
+
+# Single-repository regressions the review raised: still judged by the project's config.
+expect_deny_reason "single repository, cd /tmp && merge --repo" "drop -R, --repo, GH_REPO, or a PR URL" "$(green_merge "$project" "cd /tmp && gh pr merge 41 --repo other/repo $pin")"
+expect_allow "single repository, cd /tmp && merge, as before" "$(green_merge "$project" "cd /tmp && gh pr merge 41 $pin")"
+check "single repository, cd /tmp && merge still runs gh in the project" only_ran_in "$project"
+write_config on-green true
+expect_deny "single repository, git --git-dir … add -A" "$(run_bash "$project" "git --git-dir /elsewhere/.git add -A")"
+expect_deny "single repository, git --work-tree= … add ." "$(run_bash "$project" "git --work-tree=/elsewhere add .")"
+expect_deny "single repository, cd /tmp && git add -A" "$(run_bash "$project" "cd /tmp && git add -A")"
+write_config on-green false
+
+# Stage-all without a config at the session folder: b sets deny_stage_all, a does not.
+expect_deny "parent without a config, stage-all in the child that denies it" "$(run_bash "$pn" "cd b && git add -A")"
+expect_allow "parent without a config, stage-all in the child that allows it" "$(run_bash "$pn" "cd a && git add -A")"
+expect_allow "parent without a config, stage-all outside every repository" "$(run_bash "$pn" "git add -A")"
+expect_deny_reason "parent without a config, stage-all in an unknown directory" "working directory is unknown" "$(run_bash "$pn" "git --git-dir x/.git add -A")"
+
 # SessionEnd removes the session's markers wherever they were written.
 guard_at "$pn" "$(session_event SessionEnd)" >/dev/null
 check "parent without a config, SessionEnd removes every child's markers" absent "$pn/a/.spade/guard/$session" "$pn/b/.spade/guard/$session"
