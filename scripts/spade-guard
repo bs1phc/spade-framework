@@ -241,7 +241,7 @@ relative_path() {
 }
 
 path_words() {
-    # Arguments: project-relative path. Prints its words, lowercased, separated
+    # Arguments: repository-relative path. Prints its words, lowercased, separated
     # by single spaces and surrounded by spaces, so a term can be matched as a
     # whole word instead of as a substring. `access-token.ts` yields
     # ` access token ts `, so it matches the term `token`, while `tokenizer.ts`
@@ -285,7 +285,7 @@ is_framework_repo() {
 }
 
 protected_category() {
-    # Arguments: project-relative path, mode (quick|deliver).
+    # Arguments: repository-relative path, mode (quick|deliver).
     # Prints the first matching category name or nothing.
     # The category list mirrors docs/FRAMEWORK.md § Security-sensitive path
     # surface, which stays the definition; this is a path-shaped approximation
@@ -874,7 +874,7 @@ rollup_green() {
 }
 
 merge_reason() {
-    # Arguments: project-relative path. Prints why merging a change to this path
+    # Arguments: repository-relative path. Prints why merging a change to this path
     # still needs a human under on-green, or nothing. This is the merge floor in
     # docs/FRAMEWORK.md § Ship and merge policy: the deliver-mode hard-halt
     # categories, CI, and the owner's guards.human_merge_paths globs. It stays
@@ -899,7 +899,7 @@ merge_reason() {
 }
 
 is_migration() {
-    # Arguments: project-relative path. Succeeds for a migration file. The
+    # Arguments: repository-relative path. Succeeds for a migration file. The
     # general classifier files *.sql under schemas first, so it cannot answer this.
     has_word_prefix "$(path_words "$1")" migrat && return 0
     case "$1" in db/migrate/*|*/db/migrate/*|alembic/versions/*|*/alembic/versions/*) return 0 ;; esac
