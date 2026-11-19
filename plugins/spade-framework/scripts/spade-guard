@@ -322,7 +322,7 @@ protected_category() {
         echo "production data"; return
     fi
     case "$lower" in
-        .spade/config|.claude/settings.json|.claude/settings.local.json|hooks/hooks.json|src/hooks/hooks.json|bin/spade-guard|scripts/spade-guard|plugins/spade-framework/scripts/spade-guard|*/.claude/settings.json|*/.claude/settings.local.json|*/hooks/hooks.json|*/bin/spade-guard|*/scripts/spade-guard)
+        .spade/config|.spade/guard/*/repos|*/.spade/guard/*/repos|.claude/settings.json|.claude/settings.local.json|hooks/hooks.json|src/hooks/hooks.json|bin/spade-guard|scripts/spade-guard|plugins/spade-framework/scripts/spade-guard|*/.claude/settings.json|*/.claude/settings.local.json|*/hooks/hooks.json|*/bin/spade-guard|*/scripts/spade-guard)
             echo "permission widening"; return ;;
     esac
 
@@ -652,7 +652,8 @@ target_dirs() {
     # Arguments: merge or stage, start directory (the hook input's cwd).
     # Reads normalized segments and prints the working directory of the first
     # merge (merge) or of every stage-all `git add` (stage), one per line, as
-    # an absolute path, or as `?`, a tab, and why when the guard cannot know it.
+    # an absolute path followed by a tab before each folder a cd moved to, or
+    # as `?`, a tab, and why when the guard cannot know it.
     #
     # The directory is an allow-list, not a list of forms to refuse. It is the
     # cwd, moved only by a run of commands at the very start of the input,
@@ -680,7 +681,15 @@ target_dirs() {
     # the link's target, not the folder holding the link.
     #
     # Symbolic links are checked by the caller, which can test the filesystem.
-    awk -F'\t' -v kind="$1" -v start="$2" -v home="${HOME:-}" -v cdpath="${CDPATH:-}" "$guard_awk_lib"'
+    # The paths go through ENVIRON, not -v, because awk decodes backslash
+    # escapes in a -v value: a folder named \057..\057api would read as /../api.
+    SPADE_GUARD_START="$2" SPADE_GUARD_HOME="${HOME:-}" SPADE_GUARD_CDPATH="${CDPATH:-}" \
+    awk -F'\t' -v kind="$1" "$guard_awk_lib"'
+        BEGIN {
+            start = ENVIRON["SPADE_GUARD_START"]
+            home = ENVIRON["SPADE_GUARD_HOME"]
+            cdpath = ENVIRON["SPADE_GUARD_CDPATH"]
+        }
         function norm(p,   n, parts, k, out) {
             n = split(p, parts, "/"); out = ""
             for (k = 1; k <= n; k++) {
@@ -757,6 +766,7 @@ target_dirs() {
             if (cdpath != "" && substr(p, 1, 1) != "/" && substr(p, 1, 1) != "~")
                 return "a relative cd while CDPATH is set"
             dir = resolve(dir, p)
+            trail = trail "\t" dir
             names_home()
             return ""
         }
@@ -770,7 +780,7 @@ target_dirs() {
             if (why != "") return "?\t" why
             names_home()
             d = dir
-            if (kind != "stage") return d
+            if (kind != "stage") return d trail
             for (k = hit + 1; k <= NF && substr(w(k), 1, 1) == "-"; k++) {
                 if (substr($k, 1, 1) == "\003") return "?\ta git option the shell rewrites"
                 if ($k == "--git-dir" || $k == "--work-tree" || $k ~ /^--(git-dir|work-tree)=/)
@@ -785,7 +795,7 @@ target_dirs() {
                     d = (substr(p, 1, 1) == "/") ? p : d "/" p
                 }
             }
-            return d
+            return d trail
         }
         { raw[NR] = $0 }
         END {
@@ -797,7 +807,7 @@ target_dirs() {
                 if (NF > 1) { commands++; at[commands] = r; between[commands] = "" }
                 between[commands] = between[commands] substr($1, 1, 1)
             }
-            dir = start; unknown = ""; home_named = 0
+            dir = start; trail = ""; unknown = ""; home_named = 0
             if (between[0] !~ /^n*$/) unknown = "a subshell, brace group, or separator before it"
             for (c = 1; c <= commands; c++) {
                 $0 = raw[at[c]]
@@ -862,8 +872,21 @@ symlink_checked() {
     # is followed physically, as git -C does; a cd's `..` was already
     # resolved lexically, as the shell does.
     case "$1" in "?"*) printf '%s\n' "$1"; return 0 ;; esac
-    checked=$(normalize_abs "$1")
-    real=$(cd -P -- "$1" 2>/dev/null && pwd -P) || real=""
+    # After the directory come the folders each cd moved to, as the shell
+    # spelled them. bash enters a cd's lexical folder, but when it cannot,
+    # quietly falls back to the physical path, so every one must be enterable.
+    dir_only=${1%%"$tab"*}
+    case "$1" in *"$tab"*) cd_steps=${1#*"$tab"} ;; *) cd_steps="" ;; esac
+    while [ -n "$cd_steps" ]; do
+        cd_step=${cd_steps%%"$tab"*}
+        case "$cd_steps" in *"$tab"*) cd_steps=${cd_steps#*"$tab"} ;; *) cd_steps="" ;; esac
+        if ! (cd -P -- "$cd_step") >/dev/null 2>&1; then
+            printf '?\ta cd to a folder the shell cannot enter as written (%s)\n' "$(normalize_abs "$cd_step")"
+            return 0
+        fi
+    done
+    checked=$(normalize_abs "$dir_only")
+    real=$(cd -P -- "$dir_only" 2>/dev/null && pwd -P) || real=""
     if [ -z "$real" ]; then
         printf '?\ta folder that does not exist (%s)\n' "$checked"
         return 0

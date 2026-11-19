@@ -934,6 +934,40 @@ expect_allow "the hook cwd alone, the everyday form" "$(green_merge_at "$rs" "gh
 expect_deny_reason "an exported GIT_DIR before a stage-all" "working directory is unknown" "$(run_bash "$rs" "export GIT_DIR=$rs/web/.git; git add -A" "$rs/api")"
 expect_allow "stage-all in a child without deny_stage_all, the everyday form" "$(run_bash "$rs" "git add -A" "$rs/api")"
 
+# The hook cwd reaches the walker byte for byte. awk -v would decode the
+# backslash escapes in this folder name to /../, judging api instead of web.
+decoy="$rs/web/\\057..\\057api"
+mkdir -p "$decoy"
+expect_deny "a hook cwd with backslash escapes, stage-all by its own repository" "$(run_bash "$rs" "git add -A" "$decoy")"
+expect_ran_in "a hook cwd with backslash escapes, merge in its own repository" "$rs/web" "$(gh_ran_in "$rs" "gh pr merge 41 $pin" "$decoy")"
+expect_ran_in "a cd after a hook cwd with backslash escapes" "$rs/web" "$(gh_ran_in "$rs" "cd . && gh pr merge 41 $pin" "$decoy")"
+rm -rf "$decoy"
+
+# bash enters a cd's lexical folder, but falls back to the physical path when
+# that folder is missing. Here api/L links into web, api/Q is missing and
+# web/Q exists, so bash ends in web while the lexical walk ends in api.
+mkdir -p "$rs/web/sub" "$rs/web/Q"
+ln -s "$rs/web/sub" "$rs/api/L"
+expect_deny_reason "a cd whose lexical folder is missing, stage-all" "cannot enter as written" "$(run_bash "$rs" "cd api/L/../Q && cd .. && git add -A" "$rs")"
+expect_deny_reason "a cd whose lexical folder is missing, merge" "cannot enter as written" "$(green_merge_at "$rs" "cd api/L/../Q && cd .. && gh pr merge 41 $pin" "$rs")"
+expect_allow "a cd through a link whose lexical folder exists, the everyday form" "$(run_bash "$rs" "cd api/L/.. && git add -A" "$rs")"
+rm -f "$rs/api/L"
+rm -rf "$rs/web/sub" "$rs/web/Q"
+
+# The recorded list decides which config a call is judged by, so an armed
+# session cannot rewrite it with a file tool, wherever it lives.
+arm "$rs" deliver
+expect_deny_reason "armed deliver, write the session's repos list" "permission widening" "$(guard_at "$rs" "$(pre_tool Write "$(jq -cn --arg p "$rs/.spade/guard/$session/repos" '{file_path:$p}')")")"
+expect_deny_reason "armed deliver, edit the session's repos list" "permission widening" "$(edit_at "$rs" "$rs/.spade/guard/$session/repos")"
+expect_allow "armed deliver, another file under .spade/, the everyday form" "$(edit_at "$rs" "$rs/.spade/plans/PS-1.md")"
+disarm "$rs"
+arm "$pn/a" deliver
+expect_deny_reason "armed child deliver, its copy of the repos list" "permission widening" "$(edit_at "$pn" "$pn/a/.spade/guard/$session/repos")"
+disarm "$pn/a"
+arm "$rs/web" quick
+expect_deny_reason "armed child quick, the parent's repos list" "outside the armed repository" "$(edit_at "$rs" "$rs/.spade/guard/$session/repos")"
+disarm "$rs/web"
+
 # A single-repository session resolves an unknown directory to the session
 # folder, exactly as before.
 expect_allow "single repository, unknown directory, merge" "$(green_merge "$project" 'cd "$X" && gh pr merge 41 --squash --match-head-commit abc123')"
