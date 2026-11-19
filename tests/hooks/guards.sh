@@ -967,7 +967,17 @@ expect_deny_reason "a hook cwd whose name holds a tab, stage-all" "tab or line b
 expect_deny_reason "a hook cwd whose name holds a tab, merge" "tab or line break" "$(green_merge_at "$rs" "gh pr merge 41 $pin" "$rs/web/ui$tab")"
 expect_deny_reason "a hook cwd whose name holds a line break, stage-all" "tab or line break" "$(run_bash "$rs" "git add -A" "$rs/web/ui$nl/tmp")"
 expect_deny_reason "a hook cwd whose name holds a line break, merge outside every repository" "tab or line break" "$(green_merge_at "$pn" "gh pr merge 41 $pin" "$pn/a$nl""x")"
+expect_deny_reason "a hook cwd ending in a line break, stage-all" "tab or line break" "$(run_bash "$rs" "git add -A" "$rs/web/ui$nl")"
+expect_deny_reason "a hook cwd ending in a line break, merge" "tab or line break" "$(green_merge_at "$rs" "gh pr merge 41 $pin" "$rs/web/ui$nl")"
 rm -rf "$rs/web/ui$tab" "$rs/web/ui$nl" "$pn/a$nl""x"
+
+# On a case-insensitive filesystem WEB/.spade/config is web's config, so an
+# armed ancestor also classifies the path against the recorded repository
+# that matches it without regard to case.
+arm "$rs" deliver
+expect_deny_reason "armed parent deliver, a child's config spelled in another case" "permission widening" "$(guard_at "$rs" "$(pre_tool Write "$(jq -cn --arg p "$rs/WEB/.spade/config" '{file_path:$p}')")")"
+expect_allow "armed parent deliver, a child's README spelled in another case, the everyday form" "$(edit_at "$rs" "$rs/WEB/README.md")"
+disarm "$rs"
 
 # The recorded list decides which config a call is judged by, so an armed
 # session cannot rewrite it with a file tool, wherever it lives.

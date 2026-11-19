@@ -427,6 +427,20 @@ guard_protected_path() {
     case "$path" in /*) abs="$path" ;; *) abs="$project_dir/$path" ;; esac
     abs=$(normalize_abs "$abs")
     own=$(repo_for "$abs")
+    # On a case-insensitive filesystem WEB/x is web/x, so the recorded
+    # repository that holds the path without regard to case is classified too.
+    folded_abs=$(printf '%s' "$abs" | tr '[:upper:]' '[:lower:]')
+    own_folded=""; own_folded_key=""
+    while IFS= read -r candidate; do
+        [ -n "$candidate" ] || continue
+        candidate_key=$(printf '%s' "$candidate" | tr '[:upper:]' '[:lower:]')
+        case "$folded_abs" in
+            "$candidate_key"|"$candidate_key"/*)
+                [ "${#candidate_key}" -gt "${#own_folded_key}" ] && { own_folded="$candidate"; own_folded_key="$candidate_key"; } ;;
+        esac
+    done <<EOF
+$repos
+EOF
     while IFS= read -r armed_repo; do
         [ -n "$armed_repo" ] || continue
         mode=$(repo_mode "$armed_repo")
@@ -442,6 +456,9 @@ guard_protected_path() {
         classify_edit "$armed_repo" "$rel" "$mode"
         if [ -n "$own" ] && [ "$own" != "$armed_repo" ]; then
             classify_edit "$own" "$(relative_path "$abs" "$own")" "$mode"
+        fi
+        if [ -n "$own_folded" ] && [ "$own_folded" != "$armed_repo" ] && [ "$own_folded" != "$own" ]; then
+            classify_edit "$own_folded" "$(relative_path "$folded_abs" "$own_folded_key")" "$mode"
         fi
     done <<EOF
 $repos
@@ -1182,13 +1199,21 @@ case "$tool" in
         command=$(printf '%s' "$input" | jq -r '.tool_input.command // ""')
         segments=$(printf '%s' "$command" | normalized_segments)
         # The command starts in the hook input's cwd, else the session folder.
-        start_dir=$(printf '%s' "$input" | jq -r '.cwd // ""')
+        # The trailing dot keeps a line break at the end of the name, which
+        # command substitution would strip.
+        start_dir=$(printf '%s' "$input" | jq -r '(.cwd // "") + "."')
+        start_dir=${start_dir%.}
         case "$start_dir" in
             "") start_dir="$project_dir" ;;
             /*) ;;
             *) start_dir="$project_dir/$start_dir" ;;
         esac
-        start_dir=$(normalize_abs "$start_dir")
+        case "$start_dir" in
+            # target_dirs reports this as unknown; normalize_abs would strip
+            # a trailing line break, so it is not normalised.
+            *"$tab"*|*"$nl"*) ;;
+            *) start_dir=$(normalize_abs "$start_dir") ;;
+        esac
         guard_stage_all
         guard_merge ;;
 esac
