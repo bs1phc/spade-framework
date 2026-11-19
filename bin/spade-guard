@@ -479,46 +479,56 @@ normalized_segments() {
     # A literal tab inside a token is folded to a space so it cannot forge a
     # field boundary downstream.
     #
-    # A token that starts with `~` and had any character quoted or escaped
-    # gets a leading \003 mark, because the shell does not expand that tilde:
-    # `cd '~'` and `cd \~` name a folder called `~`, not $HOME.
+    # A token whose text is not what the shell will see gets a leading \003
+    # mark, which a check that needs a literal value refuses:
+    # - a `~` start with any character quoted or escaped, because the shell
+    #   does not expand that tilde: `cd '~'` and `cd \~` name a folder called
+    #   `~`, not $HOME
+    # - `$'...'` or `$"..."`, which the shell decodes or translates
+    # - a backtick inside double quotes, a substitution the shell runs
+    # - a backslash inside double quotes, which the shell keeps before most
+    #   characters, so `"a/\../b"` is not `a/../b`
+    # The command matchers look through the mark (guard_awk_lib), so it never
+    # hides a stage-all or a merge.
     awk '
-        function tok(cur, quoted) {
-            return (quoted && substr(cur, 1, 1) == "~") ? "\003" cur : cur
+        function tok(cur, quoted, opaque) {
+            return (opaque || (quoted && substr(cur, 1, 1) == "~")) ? "\003" cur : cur
         }
-        function emit(line, lifted,   i, c, cur, has, quote, out, count, len, quoted) {
-            cur = ""; has = 0; quote = ""; out = ""; count = 0; quoted = 0
+        function emit(line, lifted,   i, c, cur, has, quote, out, count, len, quoted, opaque) {
+            cur = ""; has = 0; quote = ""; out = ""; count = 0; quoted = 0; opaque = 0
             len = length(line)
             for (i = 1; i <= len; i++) {
                 c = substr(line, i, 1)
                 if (c == "\t") c = " "
                 if (quote != "") {
                     if (quote == "\"" && c == "\\") {
+                        opaque = 1
                         i++
                         if (i <= len) { cur = cur substr(line, i, 1); has = 1 }
                         continue
                     }
+                    if (quote == "\"" && c == "`") opaque = 1
                     if (c == quote) quote = ""
                     else { cur = cur c; has = 1 }
                     continue
                 }
-                if (c == "$" && (substr(line, i + 1, 1) == "\047" || substr(line, i + 1, 1) == "\"")) continue
+                if (c == "$" && (substr(line, i + 1, 1) == "\047" || substr(line, i + 1, 1) == "\"")) { opaque = 1; continue }
                 if (c == "\047" || c == "\"") { quote = c; has = 1; quoted = 1; continue }
                 if (c == "\\") { i++; if (i <= len) { cur = cur substr(line, i, 1); has = 1; quoted = 1 } continue }
                 if (c == ";" || c == "|" || c == "&" || c == "(" || c == ")" || c == "`") {
-                    if (has) { out = out (count++ == 0 ? "" : "\t") tok(cur, quoted); cur = ""; has = 0; quoted = 0 }
+                    if (has) { out = out (count++ == 0 ? "" : "\t") tok(cur, quoted, opaque); cur = ""; has = 0; quoted = 0; opaque = 0 }
                     print c lifted (count > 0 ? "\t" out : "")
                     out = ""; count = 0
                     continue
                 }
                 if (c == " ") {
-                    if (has) { out = out (count++ == 0 ? "" : "\t") tok(cur, quoted); cur = ""; has = 0; quoted = 0 }
+                    if (has) { out = out (count++ == 0 ? "" : "\t") tok(cur, quoted, opaque); cur = ""; has = 0; quoted = 0; opaque = 0 }
                     continue
                 }
                 cur = cur c
                 has = 1
             }
-            if (has) out = out (count++ == 0 ? "" : "\t") tok(cur, quoted)
+            if (has) out = out (count++ == 0 ? "" : "\t") tok(cur, quoted, opaque)
             print "n" lifted (count > 0 ? "\t" out : "")
         }
         {
@@ -574,30 +584,35 @@ normalized_segments() {
 
 # Matchers shared by every reader of normalized segments, so the stage-all
 # check, the merge check, and the working-directory walker agree on which
-# segment runs what. Each takes the field index of a candidate command word.
+# segment runs what. Each takes the field index of a candidate command word,
+# and reads tokens through w(), which drops the \003 mark (normalized_segments)
+# so a token the shell rewrites still matches as the text the guard read.
 guard_awk_lib='
+    function w(k) {
+        return (substr($k, 1, 1) == "\003") ? substr($k, 2) : $k
+    }
     function stage_all_at(i,   j, k) {
         # `git add` with a stage-everything operand. Every token is scanned
         # rather than guessing which one is the command word, so environment
         # assignments and wrapper commands such as env, sudo, or xargs cannot
         # hide the invocation by sitting in front of it, whatever flags those
         # wrappers take.
-        if ($i != "git") return 0
+        if (w(i) != "git") return 0
         j = i + 1
-        while (j <= NF && substr($j, 1, 1) == "-") {
-            if ($j == "-C" || $j == "-c" || $j == "--git-dir" || $j == "--work-tree") j++
+        while (j <= NF && substr(w(j), 1, 1) == "-") {
+            if (w(j) == "-C" || w(j) == "-c" || w(j) == "--git-dir" || w(j) == "--work-tree") j++
             j++
         }
-        if (j > NF || $j != "add") return 0
+        if (j > NF || w(j) != "add") return 0
         for (k = j + 1; k <= NF; k++)
-            if ($k == "-A" || $k == "--all" || $k == "." || $k == "--no-ignore-removal") return 1
+            if (w(k) == "-A" || w(k) == "--all" || w(k) == "." || w(k) == "--no-ignore-removal") return 1
         return 0
     }
     function merge_at(i,   k) {
-        if ($i == "gh" && $(i + 1) == "pr" && $(i + 2) == "merge") return 1
-        if ($i == "glab" && $(i + 1) == "mr" && $(i + 2) == "merge") return 1
-        if ($i == "gh" && $(i + 1) == "api")
-            for (k = i + 2; k <= NF; k++) if ($k ~ /\/merge$/ || $k ~ /\/pulls\/[0-9]+\/merge/) return 1
+        if (w(i) == "gh" && w(i + 1) == "pr" && w(i + 2) == "merge") return 1
+        if (w(i) == "glab" && w(i + 1) == "mr" && w(i + 2) == "merge") return 1
+        if (w(i) == "gh" && w(i + 1) == "api")
+            for (k = i + 2; k <= NF; k++) if (w(k) ~ /\/merge$/ || w(k) ~ /\/pulls\/[0-9]+\/merge/) return 1
         return 0
     }
 '
@@ -616,13 +631,14 @@ merge_segment() {
     # Reads normalized segments and prints every merge invocation from its
     # command word onward, one per line, tab separated, or nothing when the
     # command merges nothing. Scans every token for the same reason
-    # stage_all_at does.
+    # stage_all_at does. Tokens are printed without the \003 mark, so the
+    # flag and pin checks read the same text the matchers did.
     awk -F'\t' "$guard_awk_lib"'
         {
             for (i = 2; i <= NF; i++) {
                 if (!merge_at(i)) continue
-                out = $i
-                for (k = i + 1; k <= NF; k++) out = out "\t" $k
+                out = w(i)
+                for (k = i + 1; k <= NF; k++) out = out "\t" w(k)
                 print out
                 next
             }
@@ -640,20 +656,28 @@ target_dirs() {
     # cwd, moved only by a run of commands at the very start of the input,
     # each exactly `cd [-L|--] <literal path>` and joined to the next by `&&`.
     # A literal path has no `$`, glob or brace character, redirection,
-    # comment, substitution, quoted or escaped `~`, or `~user`. An unquoted
-    # `~` or `~/...` expands to $HOME unless HOME is named earlier in the
-    # command. A relative path resolves against the current value, unless the
-    # guard's own CDPATH is set. Anything else before the checked command
-    # makes the directory unknown, whatever it is: another command (pushd,
-    # chdir, eval, trap, a variable command word, a CDPATH assignment, cd -P),
-    # a comment, a heredoc, a subshell, a brace group, a backtick or
-    # substitution, or a joiner other than `&&`. In the checked command, a
-    # word in front of the command word that can move it (a variable, cd,
-    # chdir, pushd, popd, eval, source, trap), env -C, sudo -D, --chdir, or a
-    # CDPATH assignment makes it unknown. For stage, `git -C <literal>` moves
-    # that command's directory, and --git-dir, --work-tree, GIT_DIR, or
-    # GIT_WORK_TREE make it unknown. Symbolic links are checked by the caller,
-    # which can test the filesystem.
+    # comment, backtick, backslash, substitution, word the shell rewrites
+    # (the \003 mark: `$'...'`, `$"..."`, a quoted or escaped `~`), or
+    # `~user`. An unquoted `~` or `~/...` expands to $HOME unless HOME is
+    # named earlier in the command. A relative path resolves against the
+    # current value, unless the guard's own CDPATH is set. Anything else
+    # before the checked command makes the directory unknown, whatever it is:
+    # another command (pushd, chdir, eval, trap, a variable command word, a
+    # CDPATH assignment, cd -P), a comment, a heredoc, a subshell, a brace
+    # group, a backtick or substitution, or a joiner other than `&&`.
+    #
+    # The words in front of the checked command word are an allow-list too:
+    # `NAME=value` with a literal value (not CDPATH, nor GIT_DIR or
+    # GIT_WORK_TREE for stage), `command`, `time`, `env`, and `nice` with no
+    # option or a numeric -n. Any other word there (find -execdir, pnpm -C,
+    # git -C ... bisect run, sudo, a variable) makes the directory unknown.
+    # For stage, `git -C <literal>` moves that command's directory, and
+    # --git-dir, --work-tree, or a git option the shell rewrites make it
+    # unknown. Each `git -C` path is joined to the directory unnormalised,
+    # because git changes directory physically, so `lnk/..` is the parent of
+    # the link's target, not the folder holding the link.
+    #
+    # Symbolic links are checked by the caller, which can test the filesystem.
     awk -F'\t' -v kind="$1" -v start="$2" -v home="${HOME:-}" -v cdpath="${CDPATH:-}" "$guard_awk_lib"'
         function norm(p,   n, parts, k, out) {
             n = split(p, parts, "/"); out = ""
@@ -666,8 +690,9 @@ target_dirs() {
         }
         function literal(p) {
             # A path the guard can read as the shell will see it. \003 marks
-            # a quoted or escaped leading ~ (normalized_segments).
+            # a word the shell rewrites (normalized_segments).
             if (p == "" || p ~ /[$*?{}<>#]/ || index(p, "[") || index(p, "\002") || index(p, "\003")) return 0
+            if (index(p, "`") || index(p, "\\")) return 0
             if (substr(p, 1, 1) == "~" && p != "~" && substr(p, 1, 2) != "~/") return 0
             if ((p == "~" || substr(p, 1, 2) == "~/") && (home !~ /^\// || home_named)) return 0
             return 1
@@ -689,16 +714,30 @@ target_dirs() {
             if (s ~ /^&&n*$/) return "and"
             return "other"
         }
-        function moves_elsewhere(   k, m) {
-            # Why the checked command changes or redirects its own directory
-            # in a way the guard does not model, or "".
+        function moves_elsewhere(   k) {
+            # Why an assignment in the checked command redirects it in a way
+            # the guard does not model, or "".
             for (k = 2; k <= NF; k++) {
                 if ($k ~ /^CDPATH\+?=/) return "a CDPATH assignment"
                 if (kind == "stage" && $k ~ /^(GIT_DIR|GIT_WORK_TREE)\+?=/) return "GIT_DIR or GIT_WORK_TREE"
-                if ($k == "pushd" || $k == "popd") return "pushd or popd"
-                if ($k == "--chdir" || $k ~ /^--chdir=/) return "a --chdir option"
-                if ($k == "env" || $k == "sudo")
-                    for (m = k + 1; m <= NF; m++) if ($m ~ /^-[CD]/) return "env -C or sudo -D"
+            }
+            return ""
+        }
+        function assignment(t) {
+            # NAME=value or NAME+=value with a value the guard can read.
+            return t ~ /^[A-Za-z_][A-Za-z0-9_]*\+?=/ && !index(t, "$") && !index(t, "\002") && !index(t, "`")
+        }
+        function front_unknown(hit,   k) {
+            # Why a word in front of the command word at field hit is outside
+            # the allow-list, or "".
+            for (k = 2; k < hit; k++) {
+                if (assignment($k) || $k == "command" || $k == "time" || $k == "env") continue
+                if ($k == "nice") {
+                    if (k + 2 < hit && $(k + 1) == "-n" && $(k + 2) ~ /^[-+]?[0-9]+$/) k += 2
+                    else if (k + 1 < hit && $(k + 1) ~ /^-n[-+]?[0-9]+$/) k++
+                    continue
+                }
+                return "a word in front of the command word other than NAME=value, command, time, env, or nice"
             }
             return ""
         }
@@ -719,29 +758,29 @@ target_dirs() {
             names_home()
             return ""
         }
-        function checked_dir(hit,   d, k, why) {
+        function checked_dir(hit,   d, k, p, why) {
             # The directory of the checked command at field hit, or ? and why.
+            # For stage, a git -C path is joined unnormalised; the caller
+            # normalises it and follows it physically.
             why = moves_elsewhere()
             if (why != "") return "?\t" why
-            for (k = 2; k < hit; k++) {
-                if ((index($k, "$") || index($k, "\002") || index($k, "\003")) && $k !~ /^[A-Za-z_][A-Za-z0-9_]*\+?=/)
-                    return "?\ta variable or substitution in front of the command word"
-                if (substr($k, 1, 1) == "#" || index($k, "<<"))
-                    return "?\ta comment or heredoc in front of the command word"
-                if ($k == "cd" || $k == "chdir" || $k == "pushd" || $k == "popd" || $k == "eval" || $k == "source" || $k == "." || $k == "trap")
-                    return "?\ta word in front of the command word that can change the directory"
-            }
+            why = front_unknown(hit)
+            if (why != "") return "?\t" why
             names_home()
             d = dir
             if (kind != "stage") return d
-            for (k = hit + 1; k <= NF && substr($k, 1, 1) == "-"; k++) {
+            for (k = hit + 1; k <= NF && substr(w(k), 1, 1) == "-"; k++) {
+                if (substr($k, 1, 1) == "\003") return "?\ta git option the shell rewrites"
                 if ($k == "--git-dir" || $k == "--work-tree" || $k ~ /^--(git-dir|work-tree)=/)
                     return "?\t--git-dir or --work-tree"
                 if ($k == "-c") { k++; continue }
                 if ($k == "-C") {
                     k++
                     if (k > NF || !literal($k)) return "?\tgit -C with a path the guard cannot read literally"
-                    d = resolve(d, $k)
+                    p = $k
+                    if (p == "~") p = home
+                    else if (substr(p, 1, 2) == "~/") p = home substr(p, 2)
+                    d = (substr(p, 1, 1) == "/") ? p : d "/" p
                 }
             }
             return d
@@ -793,31 +832,44 @@ EOF
     [ -z "$best" ] || printf '%s\n' "$best"
 }
 
+physical_repo_for() {
+    # Arguments: physical absolute path. Prints the recorded repository whose
+    # physical location is the deepest one containing it, or nothing. Each
+    # repository is resolved too, so a session folder reached through a
+    # symbolic link (/tmp on macOS) still matches.
+    best=""; best_real=""
+    while IFS= read -r candidate; do
+        [ -n "$candidate" ] || continue
+        candidate_real=$(cd -P -- "$candidate" 2>/dev/null && pwd -P) || continue
+        case "$1" in
+            "$candidate_real"|"$candidate_real"/*)
+                [ "${#candidate_real}" -gt "${#best_real}" ] && { best="$candidate"; best_real="$candidate_real"; } ;;
+        esac
+    done <<EOF
+$repos
+EOF
+    [ -z "$best" ] || printf '%s\n' "$best"
+}
+
 symlink_checked() {
-    # Arguments: one target_dirs line. Prints it unchanged, or as unknown when
-    # a folder below its repository (or below the session folder, outside
-    # every repository) is a symbolic link, which the lexical comparison
-    # cannot follow.
+    # Arguments: one target_dirs line. Prints the directory normalised, or as
+    # unknown when it does not exist, or when the recorded repository that
+    # physically holds it differs from the one that lexically holds it: a
+    # symbolic link anywhere on the way, inside or outside the session folder,
+    # or a git -C path whose `..` steps out of a link's target. The directory
+    # is followed physically, as git -C does; a cd's `..` was already
+    # resolved lexically, as the shell does.
     case "$1" in "?"*) printf '%s\n' "$1"; return 0 ;; esac
-    checked="$1"
-    base=$(repo_for "$checked")
-    if [ -z "$base" ]; then
-        case "$checked" in "$project_dir"/*) base="$project_dir" ;; *) printf '%s\n' "$checked"; return 0 ;; esac
+    checked=$(normalize_abs "$1")
+    real=$(cd -P -- "$1" 2>/dev/null && pwd -P) || real=""
+    if [ -z "$real" ]; then
+        printf '?\ta folder that does not exist (%s)\n' "$checked"
+        return 0
     fi
-    walk="$base"
-    old_ifs="$IFS"; IFS='/'
-    set -f
-    set -- ${checked#"$base"}
-    set +f
-    IFS="$old_ifs"
-    for part in "$@"; do
-        [ -n "$part" ] || continue
-        walk="$walk/$part"
-        if [ -L "$walk" ]; then
-            printf '?\ta symbolic link below the repository root (%s)\n' "$walk"
-            return 0
-        fi
-    done
+    if [ "$(physical_repo_for "$real")" != "$(repo_for "$checked")" ]; then
+        printf '?\ta symbolic link: %s is physically %s\n' "$checked" "$real"
+        return 0
+    fi
     printf '%s\n' "$checked"
 }
 
@@ -1026,8 +1078,26 @@ guard_merge() {
     # URL, the environment can aim gh elsewhere: GH_REPO and GH_HOST name
     # another repository or host, and GIT_DIR or GIT_WORK_TREE another
     # checkout. An assignment anywhere in the command counts, and so does the
-    # bare name, which export, read, or printf -v can set.
-    elsewhere=$(printf '%s' "$segments" | awk -F'\t' '{ for (k = 2; k <= NF; k++) if ($k == "-R" || $k == "--repo" || $k ~ /^(-R|--repo=)./ || $k ~ /^(GH_REPO|GH_HOST|GIT_DIR|GIT_WORK_TREE)(\+?=|$)/ || $k ~ /\/pull\//) { print "yes"; exit } }')
+    # bare name, which export, read, or printf -v can set; only `unset NAME`
+    # and `env -u NAME`, which clear it, leave a bare name alone.
+    elsewhere=$(printf '%s' "$segments" | awk -F'\t' "$guard_awk_lib"'
+        function env_unsets(k,   e, m) {
+            # Field k is NAME in `env -u NAME`, with env followed only by -u pairs.
+            for (e = 2; e < k; e++) if (w(e) == "env") break
+            for (m = e + 1; m < k; m += 2) {
+                if (w(m) != "-u") return 0
+                if (m + 1 == k) return 1
+            }
+            return 0
+        }
+        {
+            for (k = 2; k <= NF; k++) {
+                t = w(k)
+                if (t == "-R" || t == "--repo" || t ~ /^(-R|--repo=)./ || t ~ /^(GH_REPO|GH_HOST|GIT_DIR|GIT_WORK_TREE)\+?=/ || t ~ /\/pull\//) { print "yes"; exit }
+                if (t ~ /^(GH_REPO|GH_HOST|GIT_DIR|GIT_WORK_TREE)$/ && w(2) != "unset" && !env_unsets(k)) { print "yes"; exit }
+            }
+        }
+    ')
     [ "$elsewhere" != yes ] || deny "SPADE guard: on-green merges only the target repository's own PR by number; drop -R, --repo, GH_REPO, or a PR URL, and leave GH_HOST, GIT_DIR, and GIT_WORK_TREE unset."
     admin=$(printf '%s' "$merge" | awk -F'\t' '{ for (k = 4; k <= NF; k++) if ($k == "--admin") { print "yes"; exit } }')
     [ "$admin" != yes ] || deny "SPADE guard: --admin bypasses branch protection, so it never merges under on-green."

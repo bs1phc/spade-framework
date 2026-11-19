@@ -28,7 +28,7 @@ file|.claude/skills/spade/SKILL.md|.claude/skills/spade/SKILL.md|20d3b01804d39a0
 file|.claude/skills/spade/references/FRAMEWORK.md|.claude/skills/spade/references/FRAMEWORK.md|ad34c0e4c51e49d4bf400dc4dbfc136fb2d25241edc947d28c83410fcff34a0f
 file|.claude/skills/unslop/SKILL.md|.claude/skills/unslop/SKILL.md|9b48512f174487df19ff4fd54980dff285140afb9b0b05eb05f4797504cbff8e
 file|.claude/skills/unslop/references/FRAMEWORK.md|.claude/skills/unslop/references/FRAMEWORK.md|ad34c0e4c51e49d4bf400dc4dbfc136fb2d25241edc947d28c83410fcff34a0f
-file|bin/spade-guard|.spade/bin/spade-guard|e1923a1eb9056d6593ba3c67dfe2647ce36221d20cf317821fd787b2fdd9f459
+file|bin/spade-guard|.spade/bin/spade-guard|d730c118a57f2e72ff688333caf526eae2a7e491795e63dc7d708725239f83eb
 file|bin/spade-lifecycle|.spade/bin/spade-lifecycle|012f39aceef0dff5b0f971ab4e722082797f7239305ee7c5d3afca476beff2db
 file|bin/spade-marker-replace|.spade/bin/spade-marker-replace|a219cc21c92a1044eca8373e69f42aac99571eb42715dd28e998c4a428bd3164
 file|bin/spade-render|.spade/bin/spade-render|f343bbee6dfac71ad3d19d5fea34eb7193fb10460d09cd3a278b425bfa871a85

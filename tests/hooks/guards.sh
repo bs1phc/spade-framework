@@ -567,6 +567,7 @@ pin="--squash --match-head-commit abc123"
 # The everyday forms resolve to the repository they name.
 expect_ran_in "cd child && merge" "$rs/web" "$(gh_ran_in "$rs" "cd web && gh pr merge 41 $pin")"
 expect_ran_in "the deepest recorded repository wins" "$rs/web/ui" "$(gh_ran_in "$rs" "cd web/ui && gh pr merge 41 $pin")"
+mkdir -p "$rs/web/src/deep"
 expect_ran_in "a folder inside a child resolves to the child" "$rs/web" "$(gh_ran_in "$rs" "cd web/src/deep && gh pr merge 41 $pin")"
 expect_ran_in "absolute cd" "$rs/api" "$(gh_ran_in "$rs" "cd $rs/api && gh pr merge 41 $pin")"
 expect_ran_in "hook cwd in a child" "$rs/api" "$(gh_ran_in "$rs" "gh pr merge 41 $pin" "$rs/api")"
@@ -892,7 +893,16 @@ check "cd child && merge ran gh in the child" only_ran_in "$cm/green"
 
 # Forms outside the allow-list make the directory unknown. From a hook cwd in
 # web (on-green, reviewed) each of these really runs the merge in api.
+# A folder literally named `\..` makes the backslash form below run in api.
+mkdir -p "$rs/api/\\../web"
 for unmodelled in '$c ../api && gh pr merge 41 --squash --match-head-commit abc123' \
+                  "cd \$'\\x2e\\x2e/api' && gh pr merge 41 $pin" \
+                  'cd "`echo ../api`" && gh pr merge 41 --squash --match-head-commit abc123' \
+                  'cd "../api/\../web" && gh pr merge 41 --squash --match-head-commit abc123' \
+                  "find ../api/.spade -maxdepth 0 -execdir gh pr merge 41 $pin \\;" \
+                  "pnpm -C ../api exec gh pr merge 41 $pin" \
+                  "yarn --cwd ../api exec gh pr merge 41 $pin" \
+                  "git -C ../api bisect run gh pr merge 41 $pin" \
                   "command eval 'cd ../api' && gh pr merge 41 $pin" \
                   "builtin eval 'cd ../api' && gh pr merge 41 $pin" \
                   "if eval 'cd ../api'; then gh pr merge 41 $pin; fi" \
@@ -963,6 +973,71 @@ expect_deny "deliver, a glob component before .. to .spade/config" "$(cd "$tmp/g
 expect_deny "deliver, a glob component escaping the project" "$(cd "$tmp/globcwd" && run_guard "$(pre_tool Write "{\"file_path\":\"$project/*/../../outside.txt\"}")")"
 expect_allow "deliver, a literal * in a safe file name" "$(cd "$tmp/globcwd" && run_guard "$(pre_tool Write "{\"file_path\":\"$project/docs/*.md\"}")")"
 clear_mode
+
+# Delivery Review findings, round 2 (PS-3305). From a hook cwd in api, which
+# allows stage-all, each of these really stages in web, which denies it.
+mkdir -p "$rs/web/\\../api" "$rs/web/sub" "$rs/api/src" "$tmp/rs-out"
+ln -s "$rs/web/sub" "$rs/api/lnk"
+ln -s "$rs/web" "$tmp/rs-out/l2"
+for stage_form in "cd \$'\\x2e\\x2e/web' && git add -A" \
+                  "git -C \$'..\\x2fweb' add -A" \
+                  'cd "`echo ../web`" && git add -A' \
+                  'git -C "`echo ../web`" add -A' \
+                  'cd "../web/\../api" && git add -A' \
+                  'find ../web/.spade -maxdepth 0 -execdir git add -A \;' \
+                  'pnpm -C ../web exec git add -A' \
+                  'yarn --cwd ../web exec git add -A' \
+                  'git -C ../web bisect run git add -A' \
+                  "cd $tmp/rs-out/l2 && git add -A" \
+                  "git -C $tmp/rs-out/l2 add -A" \
+                  'git -C lnk/.. add -A'; do
+    expect_deny_reason "stage-all really in web: $stage_form" "working directory is unknown" "$(run_bash "$rs" "$stage_form" "$rs/api")"
+done
+# The shell rewrites these words, so they are never read as a literal path.
+expect_deny_reason "an ANSI-C quoted cd is not literal" "cannot read literally" "$(run_bash "$rs" "cd \$'\\x2e\\x2e/web' && git add -A" "$rs/api")"
+expect_deny_reason "a backtick inside double quotes is not literal" "cannot read literally" "$(run_bash "$rs" 'cd "`echo ../web`" && git add -A' "$rs/api")"
+expect_deny_reason "a backslash inside double quotes is not literal" "cannot read literally" "$(run_bash "$rs" 'cd "../web/\../api" && git add -A' "$rs/api")"
+# The everyday forms stay allowed.
+expect_allow "stage-all after cd ../api from web" "$(run_bash "$rs" "cd ../api && git add -A" "$rs/web")"
+expect_allow "stage-all after a double-quoted cd from web" "$(run_bash "$rs" 'cd "../api" && git add -A' "$rs/web")"
+expect_allow "stage-all with git -C ../api from web" "$(run_bash "$rs" "git -C ../api add -A" "$rs/web")"
+expect_deny "an ANSI-C quoted flag is still a stage-all" "$(run_bash "$rs" "git add \$'-A'" "$rs/web")"
+expect_deny "an ANSI-C quoted command word is still a stage-all" "$(run_bash "$rs" "\$'git' add -A" "$rs/web")"
+for prefix in "command" "time" "nice" "nice -n 5" "nice -n5" "env GIT_PAGER=cat" "GIT_PAGER=cat" "GIT_PAGER=cat command"; do
+    expect_allow "stage-all behind $prefix" "$(run_bash "$rs" "$prefix git add -A" "$rs/api")"
+done
+expect_deny_reason "stage-all behind sudo, unknown" "working directory is unknown" "$(run_bash "$rs" "sudo git add -A" "$rs/api")"
+expect_deny_reason "stage-all behind an assignment that is not literal, unknown" "working directory is unknown" "$(run_bash "$rs" 'X=$Y git add -A' "$rs/api")"
+ln -s "$rs/api/src" "$rs/api/srclink"
+expect_allow "a symlinked folder inside the same repository" "$(run_bash "$rs" "cd srclink && git add -A" "$rs/api")"
+expect_allow "cd through a symlink and back up, which the shell resolves lexically" "$(run_bash "$rs" "cd lnk/.. && git add -A" "$rs/api")"
+expect_deny_reason "a folder that does not exist" "working directory is unknown" "$(run_bash "$rs" "cd nosuch && git add -A" "$rs/api")"
+
+# Merges: the everyday prefixes still read the repository, and gh runs there.
+for prefix in "command" "time" "nice -n 5" "env GH_PROMPT_DISABLED=1"; do
+    expect_ran_in "merge behind $prefix" "$rs/web" "$(GH_STUB_VIEW="$green" gh_ran_in "$rs" "$prefix gh pr merge 41 $pin" "$rs/web")"
+done
+expect_ran_in "merge after cd ../web from api" "$rs/web" "$(GH_STUB_VIEW="$green" gh_ran_in "$rs" "cd ../web && gh pr merge 41 $pin" "$rs/api")"
+# A symlink outside the session folder into a recorded repository: og is
+# on-green and reviewed, legacy is human, and the merge really runs in legacy.
+mkdir -p "$tmp/og-out"
+ln -s "$og/legacy" "$tmp/og-out/l3"
+expect_deny_reason "a symlink outside the session folder into a recorded repository" "working directory is unknown" "$(green_merge "$og" "cd $tmp/og-out/l3 && gh pr merge 41 $pin")"
+expect_allow "the on-green parent's own merge, the everyday form" "$(green_merge "$og" "cd $og && gh pr merge 41 $pin")"
+
+# Unsetting GH_HOST or GIT_DIR is the remedy the deny suggests, so it merges.
+for unset_form in "unset GIT_DIR GH_HOST && gh pr merge 41 $pin" \
+                  "env -u GIT_DIR gh pr merge 41 $pin" \
+                  "env -u GIT_DIR -u GH_HOST gh pr merge 41 $pin"; do
+    expect_allow "single repository, $unset_form" "$(green_merge "$project" "$unset_form")"
+done
+for set_form in "read GH_HOST; gh pr merge 41 $pin" \
+                "env -u GIT_DIR GH_HOST=evil.example gh pr merge 41 $pin" \
+                "unset GIT_DIR; export GH_HOST; gh pr merge 41 $pin" \
+                "GH_HOST+=x gh pr merge 41 $pin" \
+                "env GIT_DIR gh pr merge 41 $pin"; do
+    expect_deny_reason "single repository, $set_form" "drop -R, --repo, GH_REPO, or a PR URL" "$(green_merge "$project" "$set_form")"
+done
 
 # SessionEnd removes the session's markers wherever they were written.
 guard_at "$pn" "$(session_event SessionEnd)" >/dev/null
