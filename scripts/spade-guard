@@ -652,7 +652,8 @@ target_dirs() {
     # Arguments: merge or stage, start directory (the hook input's cwd).
     # Reads normalized segments and prints the working directory of the first
     # merge (merge) or of every stage-all `git add` (stage), one per line, as
-    # an absolute path followed by a tab before each folder a cd moved to, or
+    # an absolute path followed by a tab before each folder a cd moved to or
+    # had to pass through (the folder in front of each `..`), or
     # as `?`, a tab, and why when the guard cannot know it.
     #
     # The directory is an allow-list, not a list of forms to refuse. It is the
@@ -681,6 +682,13 @@ target_dirs() {
     # the link's target, not the folder holding the link.
     #
     # Symbolic links are checked by the caller, which can test the filesystem.
+    # Fields are tab-separated and directories one per line, so a start
+    # directory holding either character is unknown rather than cut short.
+    case "$2" in
+        *"$tab"*|*"$nl"*)
+            printf '?\ta working directory whose name holds a tab or line break\n'
+            return 0 ;;
+    esac
     # The paths go through ENVIRON, not -v, because awk decodes backslash
     # escapes in a -v value: a folder named \057..\057api would read as /../api.
     SPADE_GUARD_START="$2" SPADE_GUARD_HOME="${HOME:-}" SPADE_GUARD_CDPATH="${CDPATH:-}" \
@@ -718,6 +726,19 @@ target_dirs() {
             else if (substr(p, 1, 2) == "~/") p = home substr(p, 2)
             else if (substr(p, 1, 1) != "/") p = base "/" p
             return norm(p)
+        }
+        function before_dotdots(base, p,   n, parts, k, acc, d, out) {
+            # The folder in front of each `..` in a cd path, tab-led. bash
+            # checks each one exists before it applies the `..`.
+            if (p == "~") p = home
+            else if (substr(p, 1, 2) == "~/") p = home substr(p, 2)
+            else if (substr(p, 1, 1) != "/") p = base "/" p
+            n = split(p, parts, "/"); acc = ""; out = ""
+            for (k = 1; k <= n; k++) {
+                if (parts[k] == "..") { d = norm(acc); out = out "\t" (d == "" ? "/" : d) }
+                acc = acc "/" parts[k]
+            }
+            return out
         }
         function joined(s) {
             # Classifies the separator characters after a command: "and" for
@@ -765,6 +786,7 @@ target_dirs() {
             if (substr(p, 1, 1) == "-" || !literal(p)) return "a cd to a path the guard cannot read literally"
             if (cdpath != "" && substr(p, 1, 1) != "/" && substr(p, 1, 1) != "~")
                 return "a relative cd while CDPATH is set"
+            trail = trail before_dotdots(dir, p)
             dir = resolve(dir, p)
             trail = trail "\t" dir
             names_home()

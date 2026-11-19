@@ -370,7 +370,7 @@ Paths are split into words at non-alphanumeric and camelCase boundaries and matc
 Well-known credential files (`id_rsa`, `authorized_keys`, `.npmrc`, `.netrc`, `kubeconfig`) are named directly.
 A check that needs a literal value, such as the merge head pin, fails rather than trusting a command substitution.
 The working directory starts from the `cwd` Claude Code reports; `cd <literal path> &&` in front of a merge works whatever that is.
-The guard reads that `cwd` byte for byte, and every folder a `cd` moves to must be enterable as written, because bash falls back to the physical path when it is not; otherwise the directory is unknown.
+The guard reads that `cwd` byte for byte, and a `cwd` whose name holds a tab or line break is unknown. Every folder a `cd` moves to, and the folder in front of each `..` in its path, must be enterable as written, because bash falls back to the physical path when one is not; otherwise the directory is unknown.
 
 **The framework's own layout.** `src/`, `skills/`, `agents/`, `plugins/`, `fragments/`, `hooks/`, `bin/`, `setup`, and the generated host trees are governance surfaces only inside this repository (detected by `src/CAPABILITIES.md` and `src/skills/` both existing).
 In a consumer repository `src/` is application code.

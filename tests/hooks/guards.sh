@@ -951,8 +951,23 @@ ln -s "$rs/web/sub" "$rs/api/L"
 expect_deny_reason "a cd whose lexical folder is missing, stage-all" "cannot enter as written" "$(run_bash "$rs" "cd api/L/../Q && cd .. && git add -A" "$rs")"
 expect_deny_reason "a cd whose lexical folder is missing, merge" "cannot enter as written" "$(green_merge_at "$rs" "cd api/L/../Q && cd .. && gh pr merge 41 $pin" "$rs")"
 expect_allow "a cd through a link whose lexical folder exists, the everyday form" "$(run_bash "$rs" "cd api/L/.. && git add -A" "$rs")"
+# bash checks every folder in front of a `..`, not only the last, so one cd
+# can hide the missing folder: api/Q is missing, and bash ends in web.
+expect_deny_reason "one cd hiding a missing folder before .., stage-all" "cannot enter as written" "$(run_bash "$rs" "cd api/L/../Q/.. && git add -A" "$rs")"
+expect_deny_reason "one cd hiding a missing folder before .., merge" "cannot enter as written" "$(green_merge_at "$rs" "cd api/L/../Q/.. && gh pr merge 41 $pin" "$rs")"
+expect_allow "a cd with .. after folders that exist, the everyday form" "$(run_bash "$rs" "cd api/../api && git add -A" "$rs")"
 rm -f "$rs/api/L"
 rm -rf "$rs/web/sub" "$rs/web/Q"
+
+# The walker's output separates fields with tabs and lines, so a hook cwd
+# whose name holds either is unknown rather than cut short.
+tab=$(printf '\t')
+mkdir -p "$rs/web/ui$tab" "$rs/web/ui$nl/tmp" "$pn/a$nl""x"
+expect_deny_reason "a hook cwd whose name holds a tab, stage-all" "tab or line break" "$(run_bash "$rs" "git add -A" "$rs/web/ui$tab")"
+expect_deny_reason "a hook cwd whose name holds a tab, merge" "tab or line break" "$(green_merge_at "$rs" "gh pr merge 41 $pin" "$rs/web/ui$tab")"
+expect_deny_reason "a hook cwd whose name holds a line break, stage-all" "tab or line break" "$(run_bash "$rs" "git add -A" "$rs/web/ui$nl/tmp")"
+expect_deny_reason "a hook cwd whose name holds a line break, merge outside every repository" "tab or line break" "$(green_merge_at "$pn" "gh pr merge 41 $pin" "$pn/a$nl""x")"
+rm -rf "$rs/web/ui$tab" "$rs/web/ui$nl" "$pn/a$nl""x"
 
 # The recorded list decides which config a call is judged by, so an armed
 # session cannot rewrite it with a file tool, wherever it lives.
