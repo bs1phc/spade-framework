@@ -711,6 +711,74 @@ expect_allow "parent without a config, stage-all in the child that allows it" "$
 expect_allow "parent without a config, stage-all outside every repository" "$(run_bash "$pn" "git add -A")"
 expect_deny_reason "parent without a config, stage-all in an unknown directory" "working directory is unknown" "$(run_bash "$pn" "git --git-dir x/.git add -A")"
 
+# Edits are judged by the repository that holds the file.
+edit_at() {
+    # Arguments: session folder, file path. Prints the guard's decision for an Edit.
+    guard_at "$1" "$(pre_tool Edit "$(jq -cn --arg p "$2" '{file_path:$p}')")"
+}
+disarm() {
+    # Arguments: repositories. Removes their mode markers.
+    for r in "$@"; do rm -f "$r/.spade/guard/$session/mode"; done
+}
+
+# A child armed from a parent session gets the child's own classification.
+arm "$pn/a" quick
+expect_deny "parent without a config, armed child quick, its auth code" "$(edit_at "$pn" "$pn/a/src/auth/login.ts")"
+expect_allow "parent without a config, armed child quick, its README" "$(edit_at "$pn" "$pn/a/README.md")"
+expect_deny_reason "armed child, a sibling repository" "outside the armed repository $pn/a" "$(edit_at "$pn" "$pn/b/README.md")"
+expect_deny_reason "armed child, the parent folder" "outside the armed repository $pn/a" "$(edit_at "$pn" "$pn/notes.md")"
+disarm "$pn/a"
+expect_allow "parent without a config, nothing armed, a sibling repository" "$(edit_at "$pn" "$pn/b/src/auth/login.ts")"
+arm "$rs/web" deliver
+expect_deny "parent with a config, armed child deliver, the child's .spade/config" "$(edit_at "$rs" "$rs/web/.spade/config")"
+expect_deny "parent with a config, armed child deliver, the child's bin/spade-guard" "$(edit_at "$rs" "$rs/web/bin/spade-guard")"
+expect_allow "parent with a config, armed child deliver, its auth code" "$(edit_at "$rs" "$rs/web/src/auth/login.ts")"
+expect_deny_reason "armed child, a sibling under a parent with a config" "outside the armed repository $rs/web" "$(edit_at "$rs" "$rs/api/README.md")"
+expect_deny_reason "armed child, a file in the parent" "outside the armed repository $rs/web" "$(edit_at "$rs" "$rs/README.md")"
+disarm "$rs/web"
+
+# An armed parent keeps today's protection over a child, and gains the child's own.
+mkdir -p "$rs/api/src/skills"
+printf 'version: 9.9.9\n' > "$rs/api/src/CAPABILITIES.md"
+arm "$rs" deliver
+expect_deny "armed parent deliver, a child's .claude/settings.json, as today" "$(edit_at "$rs" "$rs/web/.claude/settings.json")"
+expect_deny "armed parent deliver, a child's .spade/config, by the child's rules" "$(edit_at "$rs" "$rs/web/.spade/config")"
+expect_allow "armed parent deliver, a child's ordinary code" "$(edit_at "$rs" "$rs/web/src/app.ts")"
+arm "$rs" quick
+expect_deny "armed parent quick, a framework-layout child's skill" "$(edit_at "$rs" "$rs/api/src/skills/x/SKILL.md")"
+expect_deny "armed parent quick, a child's auth code" "$(edit_at "$rs" "$rs/web/src/auth/login.ts")"
+expect_allow "armed parent quick, a child's README" "$(edit_at "$rs" "$rs/web/README.md")"
+disarm "$rs"
+
+# Planted configs never become repositories, even with a .git beside them.
+guard_at "$project" "$(session_event SessionStart)" >/dev/null
+for planted in .claude bin; do
+    make_repo "$project/$planted" on-green false
+done
+set_mode deliver
+expect_deny "planted .claude/.spade/config, .claude/settings.json still protected" "$(edit_at "$project" "$project/.claude/settings.json")"
+expect_deny "planted bin/.spade/config, bin/spade-guard still protected" "$(edit_at "$project" "$project/bin/spade-guard")"
+rm -rf "$project/.claude" "$project/bin"
+
+# A nested fixture config is classified relative to the root, as today.
+make_repo "$project/fixtures/x" on-green false none
+set_mode quick
+expect_allow "nested fixture config, its AGENTS.md is not a root governance file" "$(edit_at "$project" "$project/fixtures/x/AGENTS.md")"
+set_mode deliver
+expect_allow "nested fixture config, the fixture's config is not the root config" "$(edit_at "$project" "$project/fixtures/x/.spade/config")"
+clear_mode
+
+# A mode marker counts only at a recorded repository's own .spade/guard.
+mkdir -p "$project/sub/.spade/guard/$session" "$pn/.spade/guard/$session" "$pn/c/.spade/guard/$session" "$pn/d/.spade/guard/$session"
+for decoy in "$project/sub" "$pn" "$pn/c" "$pn/d"; do
+    printf 'quick\n' > "$decoy/.spade/guard/$session/mode"
+done
+expect_allow "decoy mode in a subfolder of the project is ignored" "$(edit_at "$project" "$project/sub/src/auth/login.ts")"
+expect_allow "decoy mode in a session folder without a config is ignored" "$(edit_at "$pn" "$pn/a/src/auth/login.ts")"
+expect_allow "decoy mode in a fixture without .git is ignored" "$(edit_at "$pn" "$pn/c/src/auth/login.ts")"
+expect_allow "mode in a repository created mid-session is ignored" "$(edit_at "$pn" "$pn/d/src/auth/login.ts")"
+rm -rf "$project/sub" "$pn/.spade" "$pn/c/.spade/guard" "$pn/d/.spade/guard"
+
 # SessionEnd removes the session's markers wherever they were written.
 guard_at "$pn" "$(session_event SessionEnd)" >/dev/null
 check "parent without a config, SessionEnd removes every child's markers" absent "$pn/a/.spade/guard/$session" "$pn/b/.spade/guard/$session"

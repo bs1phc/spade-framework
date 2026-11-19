@@ -219,16 +219,19 @@ is_true() {
 }
 
 relative_path() {
-    # Arguments: absolute or relative path. Prints it normalized and relative to
-    # the project root, so `a/../.spade/config` and
-    # `$project/../$project/.spade/config` both classify as `.spade/config`.
-    # A path that escapes the project root is printed with a leading `../`.
+    # Arguments: absolute or relative path, optional base (default the session
+    # folder). Prints it normalized and relative to the base, so
+    # `a/../.spade/config` and `$project/../$project/.spade/config` both
+    # classify as `.spade/config`. A relative path resolves against the
+    # session folder. A path that escapes the base is printed with a leading
+    # `../`.
     path="$1"
+    base="${2:-$project_dir}"
     case "$path" in /*) ;; *) path="$project_dir/$path" ;; esac
     path=$(normalize_abs "$path")
     case "$path" in
-        "$project_dir"/*) printf '%s\n' "${path#"$project_dir"/}" ;;
-        "$project_dir") printf '.\n' ;;
+        "$base"/*) printf '%s\n' "${path#"$base"/}" ;;
+        "$base") printf '.\n' ;;
         *) printf '../%s\n' "${path#/}" ;;
     esac
 }
@@ -273,8 +276,8 @@ has_word_prefix() {
 is_framework_repo() {
     # The framework's own layout puts skills and the capability manifest under
     # src/. Elsewhere `src/` is application code, so those paths are governance
-    # only here.
-    [ -f "$project_dir/src/CAPABILITIES.md" ] && [ -d "$project_dir/src/skills" ]
+    # only here. Checked in the repository the path is classified against.
+    [ -f "${class_root:-$project_dir}/src/CAPABILITIES.md" ] && [ -d "${class_root:-$project_dir}/src/skills" ]
 }
 
 protected_category() {
@@ -394,21 +397,52 @@ protected_category() {
     fi
 }
 
+classify_edit() {
+    # Arguments: repository, path relative to it, mode. Denies when the path
+    # is protected in that mode, with the framework layout detected in that
+    # repository.
+    class_root="$1"
+    category=$(protected_category "$2" "$3")
+    class_root=""
+    [ -n "$category" ] || return 0
+    case "$3" in
+        deliver) deny "SPADE guard: '$2' is a protected path ($category). Deliver never edits secrets, production data, or its own permissions unattended. Halt and surface this to the human (tripwire #6)." ;;
+        *) deny "SPADE guard: '$2' is a protected path ($category) and /spade-$3 may not touch it. This is not $3-eligible; use the full SPADE loop." ;;
+    esac
+}
+
 guard_protected_path() {
-    mode_file="$session_dir/mode"
-    [ -f "$mode_file" ] || return 0
-    mode=$(head -n 1 "$mode_file" | tr -d '[:space:]')
-    case "$mode" in quick|deliver) ;; *) return 0 ;; esac
+    # Every recorded repository whose own mode marker is set is armed. An edit
+    # lexically outside an armed repository is denied. Inside it, the path is
+    # classified relative to the armed repository and, when the deepest
+    # recorded repository holding it is a different one, relative to that one
+    # too; either match denies, so no edit is judged more loosely than when
+    # the session folder was the only project.
     path=$(printf '%s' "$input" | jq -r '.tool_input.file_path // .tool_input.notebook_path // ""')
     [ -n "$path" ] || return 0
-    rel=$(relative_path "$path")
-    case "$rel" in ../*) deny "SPADE guard: '$path' resolves outside the project root; guarded modes only write inside the repository." ;; esac
-    category=$(protected_category "$rel" "$mode")
-    [ -n "$category" ] || return 0
-    case "$mode" in
-        deliver) deny "SPADE guard: '$rel' is a protected path ($category). Deliver never edits secrets, production data, or its own permissions unattended. Halt and surface this to the human (tripwire #6)." ;;
-        *) deny "SPADE guard: '$rel' is a protected path ($category) and /spade-$mode may not touch it. This is not $mode-eligible; use the full SPADE loop." ;;
-    esac
+    case "$path" in /*) abs="$path" ;; *) abs="$project_dir/$path" ;; esac
+    abs=$(normalize_abs "$abs")
+    own=$(repo_for "$abs")
+    while IFS= read -r armed_repo; do
+        [ -n "$armed_repo" ] || continue
+        mode=$(repo_mode "$armed_repo")
+        [ -n "$mode" ] || continue
+        rel=$(relative_path "$abs" "$armed_repo")
+        case "$rel" in
+            ../*)
+                if [ "$armed_repo" = "$project_dir" ]; then
+                    deny "SPADE guard: '$path' resolves outside the project root; guarded modes only write inside the repository."
+                fi
+                deny "SPADE guard: '$path' resolves outside the armed repository $armed_repo; guarded modes only write inside the repository they deliver in." ;;
+        esac
+        classify_edit "$armed_repo" "$rel" "$mode"
+        if [ -n "$own" ] && [ "$own" != "$armed_repo" ]; then
+            classify_edit "$own" "$(relative_path "$abs" "$own")" "$mode"
+        fi
+    done <<EOF
+$repos
+EOF
+    return 0
 }
 
 
@@ -975,7 +1009,7 @@ EOF
 fi
 case "$tool" in
     Edit|Write|MultiEdit|NotebookEdit)
-        [ "$root_config" = yes ] && guard_protected_path ;;
+        guard_protected_path ;;
     Bash)
         command=$(printf '%s' "$input" | jq -r '.tool_input.command // ""')
         segments=$(printf '%s' "$command" | normalized_segments)
