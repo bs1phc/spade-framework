@@ -478,9 +478,16 @@ normalized_segments() {
     #
     # A literal tab inside a token is folded to a space so it cannot forge a
     # field boundary downstream.
+    #
+    # A token that starts with `~` and had any character quoted or escaped
+    # gets a leading \003 mark, because the shell does not expand that tilde:
+    # `cd '~'` and `cd \~` name a folder called `~`, not $HOME.
     awk '
-        function emit(line, lifted,   i, c, cur, has, quote, out, count, len) {
-            cur = ""; has = 0; quote = ""; out = ""; count = 0
+        function tok(cur, quoted) {
+            return (quoted && substr(cur, 1, 1) == "~") ? "\003" cur : cur
+        }
+        function emit(line, lifted,   i, c, cur, has, quote, out, count, len, quoted) {
+            cur = ""; has = 0; quote = ""; out = ""; count = 0; quoted = 0
             len = length(line)
             for (i = 1; i <= len; i++) {
                 c = substr(line, i, 1)
@@ -496,22 +503,22 @@ normalized_segments() {
                     continue
                 }
                 if (c == "$" && (substr(line, i + 1, 1) == "\047" || substr(line, i + 1, 1) == "\"")) continue
-                if (c == "\047" || c == "\"") { quote = c; has = 1; continue }
-                if (c == "\\") { i++; if (i <= len) { cur = cur substr(line, i, 1); has = 1 } continue }
+                if (c == "\047" || c == "\"") { quote = c; has = 1; quoted = 1; continue }
+                if (c == "\\") { i++; if (i <= len) { cur = cur substr(line, i, 1); has = 1; quoted = 1 } continue }
                 if (c == ";" || c == "|" || c == "&" || c == "(" || c == ")" || c == "`") {
-                    if (has) { out = out (count++ == 0 ? "" : "\t") cur; cur = ""; has = 0 }
+                    if (has) { out = out (count++ == 0 ? "" : "\t") tok(cur, quoted); cur = ""; has = 0; quoted = 0 }
                     print c lifted (count > 0 ? "\t" out : "")
                     out = ""; count = 0
                     continue
                 }
                 if (c == " ") {
-                    if (has) { out = out (count++ == 0 ? "" : "\t") cur; cur = ""; has = 0 }
+                    if (has) { out = out (count++ == 0 ? "" : "\t") tok(cur, quoted); cur = ""; has = 0; quoted = 0 }
                     continue
                 }
                 cur = cur c
                 has = 1
             }
-            if (has) out = out (count++ == 0 ? "" : "\t") cur
+            if (has) out = out (count++ == 0 ? "" : "\t") tok(cur, quoted)
             print "n" lifted (count > 0 ? "\t" out : "")
         }
         {
@@ -629,19 +636,25 @@ target_dirs() {
     # merge (merge) or of every stage-all `git add` (stage), one per line, as
     # an absolute path, or as `?`, a tab, and why when the guard cannot know it.
     #
-    # The directory starts at the cwd and carries across lines. `cd [--|-L|-P]
-    # <dir>` moves it when it is joined to the next command by `&&` and every
-    # command after it up to the checked one is joined by `&&` or `|`. `~` and
-    # `~/...` expand to $HOME, and a relative path resolves against the
-    # current value. Anything else that can change the directory makes it
-    # unknown: a cd joined any other way, a cd argument the guard cannot read
-    # literally (a variable, a substitution, a glob, `-`, `~user`), pushd,
-    # popd, `builtin cd`, `command cd`, eval, source, `env -C`, a CDPATH
-    # assignment, and any subshell, backtick, or substitution before the
-    # checked command. For stage, `git -C <literal>` moves that command's
-    # directory, and --git-dir, --work-tree, GIT_DIR, or GIT_WORK_TREE make it
-    # unknown.
-    awk -F'\t' -v kind="$1" -v start="$2" -v home="${HOME:-}" "$guard_awk_lib"'
+    # The directory is an allow-list, not a list of forms to refuse. It is the
+    # cwd, moved only by a run of commands at the very start of the input,
+    # each exactly `cd [-L|--] <literal path>` and joined to the next by `&&`.
+    # A literal path has no `$`, glob or brace character, redirection,
+    # comment, substitution, quoted or escaped `~`, or `~user`. An unquoted
+    # `~` or `~/...` expands to $HOME unless HOME is named earlier in the
+    # command. A relative path resolves against the current value, unless the
+    # guard's own CDPATH is set. Anything else before the checked command
+    # makes the directory unknown, whatever it is: another command (pushd,
+    # chdir, eval, trap, a variable command word, a CDPATH assignment, cd -P),
+    # a comment, a heredoc, a subshell, a brace group, a backtick or
+    # substitution, or a joiner other than `&&`. In the checked command, a
+    # word in front of the command word that can move it (a variable, cd,
+    # chdir, pushd, popd, eval, source, trap), env -C, sudo -D, --chdir, or a
+    # CDPATH assignment makes it unknown. For stage, `git -C <literal>` moves
+    # that command's directory, and --git-dir, --work-tree, GIT_DIR, or
+    # GIT_WORK_TREE make it unknown. Symbolic links are checked by the caller,
+    # which can test the filesystem.
+    awk -F'\t' -v kind="$1" -v start="$2" -v home="${HOME:-}" -v cdpath="${CDPATH:-}" "$guard_awk_lib"'
         function norm(p,   n, parts, k, out) {
             n = split(p, parts, "/"); out = ""
             for (k = 1; k <= n; k++) {
@@ -652,11 +665,17 @@ target_dirs() {
             return out == "" ? "/" : out
         }
         function literal(p) {
-            # A path the guard can read as the shell will see it.
-            if (p == "" || p ~ /[$*?]/ || index(p, "[") || index(p, "\002")) return 0
+            # A path the guard can read as the shell will see it. \003 marks
+            # a quoted or escaped leading ~ (normalized_segments).
+            if (p == "" || p ~ /[$*?{}<>#]/ || index(p, "[") || index(p, "\002") || index(p, "\003")) return 0
             if (substr(p, 1, 1) == "~" && p != "~" && substr(p, 1, 2) != "~/") return 0
-            if ((p == "~" || substr(p, 1, 2) == "~/") && home !~ /^\//) return 0
+            if ((p == "~" || substr(p, 1, 2) == "~/") && (home !~ /^\// || home_named)) return 0
             return 1
+        }
+        function names_home(   k) {
+            # Notes any word in the current command that mentions HOME, so a
+            # later ~ is not expanded with a value the command may have changed.
+            for (k = 2; k <= NF; k++) if ($k ~ /(^|[^A-Za-z0-9_])HOME([^A-Za-z0-9_]|$)/) home_named = 1
         }
         function resolve(base, p) {
             if (p == "~") p = home
@@ -665,22 +684,17 @@ target_dirs() {
             return norm(p)
         }
         function joined(s) {
-            # Classifies the separator characters between two commands.
-            if (s ~ /[()`]/) return "paren"
-            if (s ~ /^(&&|\|\||\|)n+$/) sub(/n+$/, "", s)
-            if (s == "&&") return "and"
-            if (s == "||") return "or"
-            if (s == "|") return "pipe"
-            if (s == "&") return "bg"
-            if (s ~ /^[;n]+$/) return "seq"
+            # Classifies the separator characters after a command: "and" for
+            # `&&`, also when a line break follows it, else "other".
+            if (s ~ /^&&n*$/) return "and"
             return "other"
         }
         function moves_elsewhere(   k, m) {
-            # Why the current command changes or redirects the directory in a
-            # way the guard does not model, or "".
+            # Why the checked command changes or redirects its own directory
+            # in a way the guard does not model, or "".
             for (k = 2; k <= NF; k++) {
-                if ($k ~ /^CDPATH=/) return "a CDPATH assignment"
-                if (kind == "stage" && $k ~ /^(GIT_DIR|GIT_WORK_TREE)=/) return "GIT_DIR or GIT_WORK_TREE"
+                if ($k ~ /^CDPATH\+?=/) return "a CDPATH assignment"
+                if (kind == "stage" && $k ~ /^(GIT_DIR|GIT_WORK_TREE)\+?=/) return "GIT_DIR or GIT_WORK_TREE"
                 if ($k == "pushd" || $k == "popd") return "pushd or popd"
                 if ($k == "--chdir" || $k ~ /^--chdir=/) return "a --chdir option"
                 if ($k == "env" || $k == "sudo")
@@ -688,40 +702,36 @@ target_dirs() {
             }
             return ""
         }
-        function step(before, after,   w, k, n, opts, arg, why) {
-            # Applies one command that is not the checked one. Returns why the
-            # directory became unknown, or "".
-            why = moves_elsewhere()
-            if (why != "") return why
-            for (k = 2; k <= NF; k++) if (index($k, "\002")) return "a command substitution before it"
-            w = 2
-            while (w <= NF && $w ~ /^[A-Za-z_][A-Za-z0-9_]*=/) w++
-            if (w > NF) return ""
-            if ($w == "eval" || $w == "source" || $w == ".") return "eval or source"
-            if ($w != "cd") {
-                for (k = w + 1; k <= NF; k++) if ($k == "cd") return "a cd the guard does not model, such as builtin cd or command cd"
-                return ""
-            }
-            if (before != "start" && before != "seq" && before != "and" && before != "bg")
-                return "a cd that runs in a pipeline or after ||"
+        function step(after,   p) {
+            # Applies one command before the checked one. Only an exact
+            # `cd [-L|--] <literal path>` joined to the next command by `&&`
+            # moves the directory; anything else makes it unknown. Returns
+            # why it became unknown, or "".
+            if ($2 != "cd") return "a command before it other than cd <literal path> &&"
+            if (NF == 3) p = $3
+            else if (NF == 4 && ($3 == "-L" || $3 == "--")) p = $4
+            else return "a cd with options or arguments other than [-L|--] <path>"
             if (after != "and") return "a cd that is not joined to the next command by &&"
-            n = 0; opts = 1
-            for (k = w + 1; k <= NF; k++) {
-                if (opts && ($k == "-L" || $k == "-P")) continue
-                if (opts && $k == "--") { opts = 0; continue }
-                if (opts && substr($k, 1, 1) == "-") return "cd - or a cd option the guard does not model"
-                n++; arg = $k
-            }
-            if (n != 1) return "a cd without exactly one directory"
-            if (!literal(arg) || arg == "-") return "a cd to a path the guard cannot read literally"
-            dir = resolve(dir, arg)
-            pending = 1
+            if (substr(p, 1, 1) == "-" || !literal(p)) return "a cd to a path the guard cannot read literally"
+            if (cdpath != "" && substr(p, 1, 1) != "/" && substr(p, 1, 1) != "~")
+                return "a relative cd while CDPATH is set"
+            dir = resolve(dir, p)
+            names_home()
             return ""
         }
         function checked_dir(hit,   d, k, why) {
             # The directory of the checked command at field hit, or ? and why.
             why = moves_elsewhere()
             if (why != "") return "?\t" why
+            for (k = 2; k < hit; k++) {
+                if ((index($k, "$") || index($k, "\002") || index($k, "\003")) && $k !~ /^[A-Za-z_][A-Za-z0-9_]*\+?=/)
+                    return "?\ta variable or substitution in front of the command word"
+                if (substr($k, 1, 1) == "#" || index($k, "<<"))
+                    return "?\ta comment or heredoc in front of the command word"
+                if ($k == "cd" || $k == "chdir" || $k == "pushd" || $k == "popd" || $k == "eval" || $k == "source" || $k == "." || $k == "trap")
+                    return "?\ta word in front of the command word that can change the directory"
+            }
+            names_home()
             d = dir
             if (kind != "stage") return d
             for (k = hit + 1; k <= NF && substr($k, 1, 1) == "-"; k++) {
@@ -738,21 +748,20 @@ target_dirs() {
         }
         { raw[NR] = $0 }
         END {
+            # between[c] holds the separator characters after command c, and
+            # between[0] those before the first command.
             commands = 0; between[0] = ""
             for (r = 1; r <= NR; r++) {
                 $0 = raw[r]
                 if (NF > 1) { commands++; at[commands] = r; between[commands] = "" }
                 between[commands] = between[commands] substr($1, 1, 1)
             }
-            dir = start; pending = 0; unknown = ""
+            dir = start; unknown = ""; home_named = 0
+            if (between[0] !~ /^n*$/) unknown = "a subshell, brace group, or separator before it"
             for (c = 1; c <= commands; c++) {
                 $0 = raw[at[c]]
-                before = (c == 1 && between[0] == "") ? "start" : joined(between[c - 1])
-                after = joined(between[c])
-                if (unknown == "" && (substr($1, 2, 1) == "1" || before == "paren"))
-                    unknown = "a subshell, backtick, or command substitution before it"
-                if (unknown == "" && pending && before != "and" && before != "pipe")
-                    unknown = "a command after the cd that is not joined to it by && or |"
+                if (unknown == "" && substr($1, 2, 1) == "1")
+                    unknown = "a backtick or command substitution before it"
                 hit = 0
                 for (i = 2; i <= NF; i++) {
                     if ((kind == "merge" && merge_at(i)) || (kind == "stage" && stage_all_at(i))) { hit = i; break }
@@ -760,9 +769,10 @@ target_dirs() {
                 if (hit) {
                     print (unknown != "" ? "?\t" unknown : checked_dir(hit))
                     if (kind == "merge") exit
+                    if (unknown == "") unknown = "a command before it other than cd <literal path> &&"
                     continue
                 }
-                if (unknown == "") unknown = step(before, after)
+                if (unknown == "") unknown = step(joined(between[c]))
             }
         }
     '
@@ -783,31 +793,56 @@ EOF
     [ -z "$best" ] || printf '%s\n' "$best"
 }
 
+symlink_checked() {
+    # Arguments: one target_dirs line. Prints it unchanged, or as unknown when
+    # a folder below its repository (or below the session folder, outside
+    # every repository) is a symbolic link, which the lexical comparison
+    # cannot follow.
+    case "$1" in "?"*) printf '%s\n' "$1"; return 0 ;; esac
+    checked="$1"
+    base=$(repo_for "$checked")
+    if [ -z "$base" ]; then
+        case "$checked" in "$project_dir"/*) base="$project_dir" ;; *) printf '%s\n' "$checked"; return 0 ;; esac
+    fi
+    walk="$base"
+    old_ifs="$IFS"; IFS='/'
+    set -f
+    set -- ${checked#"$base"}
+    set +f
+    IFS="$old_ifs"
+    for part in "$@"; do
+        [ -n "$part" ] || continue
+        walk="$walk/$part"
+        if [ -L "$walk" ]; then
+            printf '?\ta symbolic link below the repository root (%s)\n' "$walk"
+            return 0
+        fi
+    done
+    printf '%s\n' "$checked"
+}
+
 guard_stage_all() {
     # Each stage-all is judged by the config of the repository it runs in.
     [ "$(printf '%s' "$segments" | git_add_operands)" = deny ] || return 0
     targets=$(printf '%s' "$segments" | target_dirs stage "$start_dir")
     while IFS= read -r target; do
         [ -n "$target" ] || continue
+        target=$(symlink_checked "$target")
         case "$target" in
             "?"*)
-                # An unknown directory is judged by the session folder's
-                # config, as before. Without one, it denies when any session
-                # repository sets deny_stage_all.
-                if [ "$root_config" = yes ]; then
-                    stage_repo="$project_dir"
-                else
-                    while IFS= read -r stage_repo; do
-                        [ -n "$stage_repo" ] || continue
-                        config="$stage_repo/.spade/config"
-                        deny_suffix=" (read $config)"
-                        is_true "$(config_value guards.deny_stage_all)" \
-                            && deny "SPADE guard: git add -A, --all, and git add . are disabled in $stage_repo (guards.deny_stage_all), and this command's working directory is unknown (${target#*"$tab"}). Stage the exact paths you changed."
-                    done <<EOF
+                # An unknown directory denies when any session repository
+                # sets deny_stage_all. In a single-repository session that is
+                # the session folder's own rule, as before.
+                while IFS= read -r stage_repo; do
+                    [ -n "$stage_repo" ] || continue
+                    config="$stage_repo/.spade/config"
+                    deny_suffix=" (read $config)"
+                    is_true "$(config_value guards.deny_stage_all)" \
+                        && deny "SPADE guard: git add -A, --all, and git add . are disabled in $stage_repo (guards.deny_stage_all), and this command's working directory is unknown (${target#*"$tab"}). Stage the exact paths you changed."
+                done <<EOF
 $repos
 EOF
-                    continue
-                fi ;;
+                continue ;;
             *)
                 stage_repo=$(repo_for "$target")
                 if [ -z "$stage_repo" ]; then
@@ -915,17 +950,25 @@ guard_merge() {
     # The merge is judged by the session repository it runs in: its config,
     # its reviewed-head record, and every gh call below run there.
     target=$(printf '%s' "$segments" | target_dirs merge "$start_dir" | head -n 1)
+    target=$(symlink_checked "$target")
     case "$target" in
-        "?"*) deny "SPADE guard: this merge's working directory is unknown (${target#*"$tab"}), so the guard cannot tell which repository's policy applies. Run it as gh pr merge on its own, or after cd <literal path> &&." ;;
+        "?"*)
+            # A single-repository session has only one policy to apply, so an
+            # unknown directory resolves to the session folder, as it did
+            # before the guard followed directories.
+            [ "$repos" = "$project_dir" ] \
+                || deny "SPADE guard: this merge's working directory is unknown (${target#*"$tab"}), so the guard cannot tell which repository's policy applies. Run it as gh pr merge on its own, or after cd <literal path> &&."
+            repo="$project_dir" ;;
+        *)
+            repo=$(repo_for "$target")
+            if [ -z "$repo" ]; then
+                # Outside every recorded repository: the session folder's
+                # config still governs, as it did before, when there is one.
+                [ "$root_config" = yes ] \
+                    || deny "SPADE guard: this merge runs in $target, outside every repository recorded for this session (.spade/guard/$sid/repos), so no merge policy covers it. A human merges it, or the merge runs from a recorded repository."
+                repo="$project_dir"
+            fi ;;
     esac
-    repo=$(repo_for "$target")
-    if [ -z "$repo" ]; then
-        # Outside every recorded repository: the session folder's config
-        # still governs, as it did before, when there is one.
-        [ "$root_config" = yes ] \
-            || deny "SPADE guard: this merge runs in $target, outside every repository recorded for this session (.spade/guard/$sid/repos), so no merge policy covers it. A human merges it, or the merge runs from a recorded repository."
-        repo="$project_dir"
-    fi
     config="$repo/.spade/config"
     # Every deny from here on depends on this config, so it names it.
     deny_suffix=" (read $config)"

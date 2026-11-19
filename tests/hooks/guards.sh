@@ -572,13 +572,10 @@ expect_ran_in "absolute cd" "$rs/api" "$(gh_ran_in "$rs" "cd $rs/api && gh pr me
 expect_ran_in "hook cwd in a child" "$rs/api" "$(gh_ran_in "$rs" "gh pr merge 41 $pin" "$rs/api")"
 expect_ran_in "relative cd from the hook cwd" "$rs/api" "$(gh_ran_in "$rs" "cd ../api && gh pr merge 41 $pin" "$rs/web")"
 expect_ran_in "cd --" "$rs/web" "$(gh_ran_in "$rs" "cd -- web && gh pr merge 41 $pin")"
-expect_ran_in "cd -P" "$rs/web" "$(gh_ran_in "$rs" "cd -P web && gh pr merge 41 $pin")"
 expect_ran_in "cd -L" "$rs/api" "$(gh_ran_in "$rs" "cd -L api && gh pr merge 41 $pin")"
 expect_ran_in "cd ~" "$rs/web" "$(STUB_HOME="$rs/web" gh_ran_in "$rs" "cd ~ && gh pr merge 41 $pin")"
 expect_ran_in "cd ~/path" "$rs/web/ui" "$(STUB_HOME="$rs/web" gh_ran_in "$rs" "cd ~/ui && gh pr merge 41 $pin")"
 expect_ran_in "two cds joined by &&" "$rs/web/ui" "$(gh_ran_in "$rs" "cd web && cd ui && gh pr merge 41 $pin")"
-expect_ran_in "a command between the cd and the merge" "$rs/web" "$(gh_ran_in "$rs" "cd web && git fetch origin && gh pr merge 41 $pin")"
-expect_ran_in "a pipe into the merge after the cd" "$rs/web" "$(gh_ran_in "$rs" "cd web && echo y | gh pr merge 41 $pin")"
 expect_ran_in "a line continuation after &&" "$rs/web" "$(gh_ran_in "$rs" "cd web && \\${nl}gh pr merge 41 $pin")"
 expect_ran_in "a newline after &&" "$rs/web" "$(gh_ran_in "$rs" "cd web &&${nl}gh pr merge 41 $pin")"
 expect_deny_reason "no cd, the session folder's policy" "merge policy is 'human'" "$(run_bash "$rs" "gh pr merge 41 $pin")"
@@ -607,6 +604,9 @@ for unknown_form in "cd web; gh pr merge 41 $pin" \
                     "eval \"cd web\" && gh pr merge 41 $pin" \
                     "source ./go.sh && gh pr merge 41 $pin" \
                     "env -C web gh pr merge 41 $pin" \
+                    "cd -P web && gh pr merge 41 $pin" \
+                    "cd web && git fetch origin && gh pr merge 41 $pin" \
+                    "cd web && echo y | gh pr merge 41 $pin" \
                     "CDPATH=$rs cd web && gh pr merge 41 $pin" \
                     "cd $rs/api && (cd $rs/web && true) && gh pr merge 41 $pin" \
                     'x=$(cd web && pwd) && gh pr merge 41 --squash --match-head-commit abc123' \
@@ -625,7 +625,7 @@ expect_allow "stage-all with git -C relative to a cd" "$(run_bash "$rs" "cd web 
 expect_allow "stage-all in the deepest repository" "$(run_bash "$rs" "cd web/ui && git add -A")"
 expect_deny "stage-all with git -C back up to its parent" "$(run_bash "$rs" "cd web/ui && git -C .. add -A")"
 expect_deny "the second of two stage-alls" "$(run_bash "$rs" "cd api && git add -A && cd ../web && git add --all")"
-expect_allow "stage-all with an unreadable git -C, judged by the session folder" "$(run_bash "$rs" 'git -C "$X" add -A')"
+expect_deny "stage-all with an unreadable git -C, denied because a recorded repository sets deny_stage_all" "$(run_bash "$rs" 'git -C "$X" add -A')"
 
 # Merges are judged by the repository they run in.
 only_ran_in() {
@@ -863,6 +863,61 @@ check "reviewed-head location: a listed child for a merge run in it" test "$(ses
 # Delivery Review findings (PS-3305). Each evasion first, then the everyday
 # form it must leave alone.
 echo "delivery review findings"
+
+# A cd inside a shell comment never moves the directory. The session folder
+# is human with deny_stage_all; the recorded child is on-green without it.
+cm="$tmp/cm"
+make_repo "$cm" human true none
+make_repo "$cm/green" on-green false
+guard_at "$cm" "$(session_event SessionStart)" >/dev/null
+mkdir -p "$cm/green/.spade/guard"
+printf 'abc123 PASS\n' > "$cm/green/.spade/guard/reviewed-head-5"
+expect_deny "a cd inside a comment, stage-all" "$(run_bash "$cm" "# note; cd green &&${nl}git add -A")"
+expect_deny_reason "a cd inside a comment, merge" "working directory is unknown" "$(green_merge "$cm" "# note; cd green &&${nl}gh pr merge 5 --match-head-commit abc123")"
+expect_allow "cd child && stage-all, the child's rule" "$(run_bash "$cm" "cd green && git add -A")"
+expect_allow "cd child && merge, the child's on-green rules" "$(green_merge "$cm" "cd green && gh pr merge 5 --match-head-commit abc123")"
+check "cd child && merge ran gh in the child" only_ran_in "$cm/green"
+
+# Forms outside the allow-list make the directory unknown. From a hook cwd in
+# web (on-green, reviewed) each of these really runs the merge in api.
+for unmodelled in '$c ../api && gh pr merge 41 --squash --match-head-commit abc123' \
+                  "command eval 'cd ../api' && gh pr merge 41 $pin" \
+                  "builtin eval 'cd ../api' && gh pr merge 41 $pin" \
+                  "if eval 'cd ../api'; then gh pr merge 41 $pin; fi" \
+                  "trap 'cd ../api' DEBUG; gh pr merge 41 $pin" \
+                  "chdir ../api && gh pr merge 41 $pin" \
+                  "CDPATH+=$rs; cd api && gh pr merge 41 $pin" \
+                  "read CDPATH <<< $rs; cd api && gh pr merge 41 $pin" \
+                  "printf -v CDPATH %s $rs; cd api && gh pr merge 41 $pin" \
+                  "HOME=$rs/api; cd ~ && gh pr merge 41 $pin" \
+                  "cd '~' && gh pr merge 41 $pin" \
+                  "cd \\~ && gh pr merge 41 $pin" \
+                  "cd \"~/\" && gh pr merge 41 $pin" \
+                  "cd -P . && gh pr merge 41 $pin"; do
+    expect_deny_reason "outside the allow-list: $unmodelled" "working directory is unknown" "$(STUB_HOME="$rs/web" green_merge_at "$rs" "$unmodelled" "$rs/web")"
+done
+expect_deny_reason "ambient CDPATH, a relative cd" "working directory is unknown" "$(CDPATH="$rs/api" green_merge_at "$rs" "cd web && gh pr merge 41 $pin" "$rs")"
+expect_allow "ambient CDPATH, an absolute cd" "$(CDPATH="$rs/api" green_merge_at "$rs" "cd $rs/web && gh pr merge 41 $pin" "$rs")"
+check "ambient CDPATH, the absolute cd ran gh in the named repository" only_ran_in "$rs/web"
+ln -s "$rs/api" "$rs/web/lnk"
+expect_deny_reason "a symlinked folder below the repository root" "working directory is unknown" "$(green_merge_at "$rs" "cd web/lnk && gh pr merge 41 $pin" "$rs")"
+expect_deny_reason "a hook cwd through a symlinked folder" "working directory is unknown" "$(green_merge_at "$rs" "gh pr merge 41 $pin" "$rs/web/lnk")"
+rm -f "$rs/web/lnk"
+expect_allow "unquoted cd ~/path, the everyday form" "$(STUB_HOME="$rs" green_merge_at "$rs" "cd ~/web && gh pr merge 41 $pin" "$rs")"
+expect_allow "cd -L, the everyday form" "$(green_merge_at "$rs" "cd -L . && gh pr merge 41 $pin" "$rs/web")"
+expect_allow "the hook cwd alone, the everyday form" "$(green_merge_at "$rs" "gh pr merge 41 $pin" "$rs/web")"
+
+# A stage-all in an unknown directory denies when any recorded repository
+# sets deny_stage_all (web does here), not only by the session folder's rule.
+expect_deny_reason "an exported GIT_DIR before a stage-all" "working directory is unknown" "$(run_bash "$rs" "export GIT_DIR=$rs/web/.git; git add -A" "$rs/api")"
+expect_allow "stage-all in a child without deny_stage_all, the everyday form" "$(run_bash "$rs" "git add -A" "$rs/api")"
+
+# A single-repository session resolves an unknown directory to the session
+# folder, exactly as before.
+expect_allow "single repository, unknown directory, merge" "$(green_merge "$project" 'cd "$X" && gh pr merge 41 --squash --match-head-commit abc123')"
+check "single repository, unknown directory, gh ran in the project" only_ran_in "$project"
+expect_allow "single repository, a command before the merge" "$(green_merge "$project" "git fetch origin && gh pr merge 41 $pin")"
+expect_allow "single repository, a comment before the merge" "$(green_merge "$project" "# note; cd x &&${nl}gh pr merge 41 $pin")"
 
 # Path normalisation never glob-expands a component against the guard's cwd.
 mkdir -p "$tmp/globcwd/a" "$tmp/globcwd/b"
