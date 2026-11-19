@@ -93,6 +93,7 @@ expect_allow "no .spade/config" "$out"
 # Session lifecycle.
 run_guard "$(jq -cn --arg s "$session" '{hook_event_name:"SessionStart", session_id:$s}')" >/dev/null
 [ -f "$project/.spade/guard/$session/live" ] && echo "  ok:   SessionStart writes live marker" || { echo "  FAIL: live marker missing"; fail=$((fail + 1)); }
+[ "$(cat "$project/.spade/guard/$session/repos" 2>/dev/null)" = "$project" ] && echo "  ok:   single repository, SessionStart records only the project" || { echo "  FAIL: single-repository list is not just the project"; fail=$((fail + 1)); }
 
 # Closing an issue is the agent's own call once Evaluate records PASS, so
 # no guard stands between it and any tracker state.
@@ -377,6 +378,149 @@ fi
 # SessionEnd cleans up.
 run_guard "$(jq -cn --arg s "$session" '{hook_event_name:"SessionEnd", session_id:$s}')" >/dev/null
 [ ! -d "$project/.spade/guard/$session" ] && echo "  ok:   SessionEnd removes session dir" || { echo "  FAIL: session dir survived SessionEnd"; fail=$((fail + 1)); }
+
+# Session repositories (PS-3305). The guard records the session's repositories
+# at the first SessionStart and judges each call by the one it targets.
+echo "session repositories"
+nl='
+'
+
+expect_deny_reason() {
+    # Arguments: label, text the reason must contain, output. Passes when the
+    # output is a deny decision whose reason contains the text.
+    if printf '%s' "$3" | jq -e --arg want "$2" '.hookSpecificOutput.permissionDecision == "deny" and (.hookSpecificOutput.permissionDecisionReason | contains($want))' >/dev/null 2>&1; then
+        echo "  ok:   deny  $1"
+    else
+        echo "  FAIL: expected deny for $1 with a reason containing '$2', got: ${3:-<empty>}"
+        fail=$((fail + 1))
+    fi
+}
+
+check() {
+    # Arguments: label, then a command. Passes when the command succeeds.
+    label="$1"; shift
+    if "$@"; then echo "  ok:   $label"; else echo "  FAIL: $label"; fail=$((fail + 1)); fi
+}
+
+absent() {
+    # Arguments: paths. Succeeds when none of them exists.
+    for p in "$@"; do [ ! -e "$p" ] || return 1; done
+}
+
+same_text() {
+    # Arguments: file, expected text. Succeeds when the file holds exactly that text.
+    [ -f "$1" ] && [ "$(cat "$1")" = "$2" ]
+}
+
+make_repo() {
+    # Arguments: folder, merge policy (or none), deny_stage_all, optional .git
+    # kind: dir (default), file (a worktree), or none (a fixture). Writes a
+    # repository with a minimal .spade/config.
+    mkdir -p "$1/.spade"
+    case "${4:-dir}" in
+        dir) mkdir -p "$1/.git" ;;
+        file) printf 'gitdir: /elsewhere/.git/worktrees/x\n' > "$1/.git" ;;
+    esac
+    {
+        printf 'mode: local\nautonomy:\n  deliver:\n'
+        [ "$2" = none ] || printf '    merge: %s\n' "$2"
+        printf 'guards:\n  deny_stage_all: %s\n' "$3"
+    } > "$1/.spade/config"
+}
+
+guard_at() {
+    # Arguments: session folder, event JSON. Prints the helper's stdout with
+    # that folder as the session folder.
+    printf '%s' "$2" | CLAUDE_PROJECT_DIR="$1" PATH="$stubs:$PATH" "$GUARD"
+}
+
+session_event() {
+    # Arguments: event name, optional SessionStart source. Prints the event.
+    jq -cn --arg e "$1" --arg s "$session" --arg src "${2:-startup}" '{hook_event_name:$e, session_id:$s, source:$src}'
+}
+
+arm() {
+    # Arguments: repository, mode. Writes that repository's mode marker.
+    mkdir -p "$1/.spade/guard/$session"
+    printf '%s\n' "$2" > "$1/.spade/guard/$session/mode"
+}
+
+# A parent with its own config: the list lives in the parent and names the
+# child and grandchild repositories, never a fixture without .git or a hidden folder.
+pc="$tmp/pc"
+make_repo "$pc" human false none
+make_repo "$pc/web" on-green false
+make_repo "$pc/libs/core" human false file
+make_repo "$pc/fixture" on-green false none
+make_repo "$pc/.hidden" on-green false
+guard_at "$pc" "$(session_event SessionStart)" >/dev/null
+check "parent with a config, live in the parent" test -f "$pc/.spade/guard/$session/live"
+check "parent with a config, list names parent, child, and worktree grandchild" same_text "$pc/.spade/guard/$session/repos" "$pc$nl$pc/web$nl$pc/libs/core"
+check "parent with a config, nothing written in the children" absent "$pc/web/.spade/guard" "$pc/libs/core/.spade/guard" "$pc/fixture/.spade/guard" "$pc/.hidden/.spade/guard"
+
+# A parent without a config: the markers go only in the children.
+pn="$tmp/pn"
+make_repo "$pn/a" on-green false
+make_repo "$pn/b" human true
+make_repo "$pn/c" on-green false none
+guard_at "$pn" "$(session_event SessionStart)" >/dev/null
+check "parent without a config, live and list in each child" test -f "$pn/a/.spade/guard/$session/live" -a -f "$pn/b/.spade/guard/$session/live"
+check "parent without a config, both copies name both children" same_text "$pn/a/.spade/guard/$session/repos" "$pn/a$nl$pn/b"
+check "parent without a config, second copy matches" same_text "$pn/b/.spade/guard/$session/repos" "$pn/a$nl$pn/b"
+check "parent without a config, nothing written in the parent or a fixture" absent "$pn/.spade" "$pn/c/.spade/guard"
+
+# A session at ~ never writes into the ~/.spade install clone.
+home="$tmp/home"
+make_repo "$home/.spade" on-green false
+make_repo "$home/work" human false
+guard_at "$home" "$(session_event SessionStart)" >/dev/null
+check "home session, list in the child repository" test -f "$home/work/.spade/guard/$session/repos"
+check "home session, nothing written in ~/.spade" absent "$home/.spade/guard" "$home/.spade/.spade/guard"
+home_only="$tmp/home-only"
+make_repo "$home_only/.spade" on-green false
+guard_at "$home_only" "$(session_event SessionStart)" >/dev/null
+check "home with only ~/.spade, nothing written" absent "$home_only/.spade/guard" "$home_only/.spade/.spade/guard"
+
+# A folder with nothing nearby stays inert and writes nothing.
+nothing="$tmp/nothing"
+make_repo "$nothing/notes" on-green true none
+mkdir -p "$nothing/a/b/c"
+make_repo "$nothing/a/b/c" on-green true
+guard_at "$nothing" "$(session_event SessionStart)" >/dev/null
+check "nothing nearby, nothing written" absent "$nothing/.spade" "$nothing/notes/.spade/guard" "$nothing/a/b/c/.spade/guard"
+expect_allow "nothing nearby, git add -A" "$(guard_at "$nothing" "$(pre_tool Bash '{"command":"git add -A"}')")"
+
+# A later SessionStart (compact, resume, clear) never grows the list, so a
+# repository created mid-session does not join it.
+make_repo "$pn/d" on-green false
+guard_at "$pn" "$(session_event SessionStart compact)" >/dev/null
+check "compact after git init, the new repository gets no markers" absent "$pn/d/.spade/guard"
+check "compact after git init, the list does not grow" same_text "$pn/a/.spade/guard/$session/repos" "$pn/a$nl$pn/b"
+make_repo "$pc/late" on-green false
+guard_at "$pc" "$(session_event SessionStart resume)" >/dev/null
+check "resume after git init under a parent with a config, the list does not grow" same_text "$pc/.spade/guard/$session/repos" "$pc$nl$pc/web$nl$pc/libs/core"
+
+# Copies of the list that disagree are treated as tampered.
+cp "$pn/b/.spade/guard/$session/repos" "$tmp/pn-b-repos"
+printf '%s\n' "$pn/d" >> "$pn/b/.spade/guard/$session/repos"
+expect_deny_reason "copies disagree, merge" "disagree" "$(guard_at "$pn" "$(pre_tool Bash '{"command":"gh pr merge 41 --squash --match-head-commit abc123"}')")"
+expect_allow "copies disagree, unarmed edit" "$(guard_at "$pn" "$(pre_tool Edit "{\"file_path\":\"$pn/a/README.md\"}")")"
+arm "$pn/a" deliver
+expect_deny_reason "copies disagree, armed edit" "disagree" "$(guard_at "$pn" "$(pre_tool Edit "{\"file_path\":\"$pn/a/README.md\"}")")"
+cp "$tmp/pn-b-repos" "$pn/b/.spade/guard/$session/repos"
+rm -f "$pn/a/.spade/guard/$session/mode"
+expect_allow "copies agree, unarmed edit" "$(guard_at "$pn" "$(pre_tool Edit "{\"file_path\":\"$pn/a/README.md\"}")")"
+
+# Without jq, a session folder with no config stays inert rather than blocking.
+nojq_out=$(printf '%s' "$(pre_tool Bash '{"command":"git add -A"}')" | CLAUDE_PROJECT_DIR="$pn" PATH="$tmp/nojq" bash "$GUARD" 2>&1) \
+    && [ -z "$nojq_out" ] && echo "  ok:   parent without a config, missing jq is inert" \
+    || { echo "  FAIL: parent without a config, missing jq should be inert, got: $nojq_out"; fail=$((fail + 1)); }
+
+# SessionEnd removes the session's markers wherever they were written.
+guard_at "$pn" "$(session_event SessionEnd)" >/dev/null
+check "parent without a config, SessionEnd removes every child's markers" absent "$pn/a/.spade/guard/$session" "$pn/b/.spade/guard/$session"
+guard_at "$pc" "$(session_event SessionEnd)" >/dev/null
+check "parent with a config, SessionEnd removes its markers" absent "$pc/.spade/guard/$session"
 
 echo
 echo "spade-guard: $fail failure(s)"

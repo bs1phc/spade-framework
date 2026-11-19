@@ -8,19 +8,70 @@ set -u
 # The rules it enforces are defined in docs/FRAMEWORK.md § Mechanical guards;
 # this script is the deterministic check, not the definition.
 #
-# Every guard is inert unless the project root holds .spade/config, so a plugin
-# install does not change behaviour in repositories that do not use SPADE.
+# Every guard is inert unless the session folder holds .spade/config or has a
+# child or grandchild git repository that does, so a plugin install does not
+# change behaviour in folders that do not use SPADE.
+#
+# The session's repositories are recorded once, at its first SessionStart, in
+# .spade/guard/<session>/repos, and each tool call is judged by the recorded
+# repository it targets (docs/FRAMEWORK.md § Mechanical guards).
 #
 # Exit codes: 0 always (decisions travel as JSON on stdout), except 2 when jq
-# is missing inside a SPADE repository, which blocks the call and names the
-# missing tool on stderr.
+# is missing and the session folder holds .spade/config, which blocks the call
+# and names the missing tool on stderr.
+
+nl='
+'
+tab=$(printf '\t')
+
+normalize_abs() {
+    # Arguments: absolute path. Prints it lexically normalized: no empty or `.`
+    # segments, every `..` resolved against the segment before it.
+    old_ifs="$IFS"; IFS='/'
+    set -- $1
+    IFS="$old_ifs"
+    normalized=""
+    for segment in "$@"; do
+        case "$segment" in
+            ""|.) ;;
+            ..) normalized="${normalized%/*}" ;;
+            *) normalized="$normalized/$segment" ;;
+        esac
+    done
+    printf '%s\n' "${normalized:-/}"
+}
 
 # Always drain stdin first so an inert exit never leaves the host with a broken pipe.
 input=$(cat)
 project_dir="${CLAUDE_PROJECT_DIR:-$PWD}"
 case "$project_dir" in /*) ;; *) project_dir="$PWD/$project_dir" ;; esac
+project_dir=$(normalize_abs "$project_dir")
 config="$project_dir/.spade/config"
-[ -f "$config" ] || exit 0
+root_config=no
+[ -f "$config" ] && root_config=yes
+
+child_repos() {
+    # Prints each child or grandchild folder of the session folder that holds
+    # both .git (a directory, or the file a worktree has) and .spade/config,
+    # one per line. Shell globs only: `*` skips hidden folders such as
+    # ~/.spade, and a folder without .git, such as a test fixture, is skipped.
+    for found in "$project_dir"/*/.spade/config "$project_dir"/*/*/.spade/config; do
+        [ -f "$found" ] || continue
+        found="${found%/.spade/config}"
+        [ -e "$found/.git" ] || continue
+        case "$found" in *"$nl"*|*"$tab"*) continue ;; esac
+        printf '%s\n' "$found"
+    done
+}
+
+children=$(child_repos)
+if [ "$root_config" = no ]; then
+    # Nothing nearby: inert before needing jq, as for any non-SPADE folder.
+    [ -n "$children" ] || exit 0
+    # Without jq such a session had no guards before either; skills see that
+    # guards are not live and stay on the strict model.
+    command -v jq >/dev/null 2>&1 || exit 0
+fi
 
 if ! command -v jq >/dev/null 2>&1; then
     echo "spade-guard: jq is required for SPADE guards and is not installed; install jq or set disableAllHooks" >&2
@@ -30,13 +81,113 @@ fi
 event=$(printf '%s' "$input" | jq -r '.hook_event_name // ""')
 tool=$(printf '%s' "$input" | jq -r '.tool_name // ""')
 session=$(printf '%s' "$input" | jq -r '.session_id // ""')
+sid="${session:-unknown}"
 guard_dir="$project_dir/.spade/guard"
-session_dir="$guard_dir/${session:-unknown}"
+session_dir="$guard_dir/$sid"
 
+deny_suffix=""
 deny() {
     # Arguments: reason. Prints one PreToolUse deny decision and exits 0.
-    jq -cn --arg reason "$1" '{hookSpecificOutput: {hookEventName: "PreToolUse", permissionDecision: "deny", permissionDecisionReason: $reason}}'
+    # A deny that depends on a config names it through deny_suffix.
+    jq -cn --arg reason "$1$deny_suffix" '{hookSpecificOutput: {hookEventName: "PreToolUse", permissionDecision: "deny", permissionDecisionReason: $reason}}'
     exit 0
+}
+
+record_repos() {
+    # SessionStart. Records the session's repositories once: the session
+    # folder when it holds .spade/config, plus every child_repos entry. With a
+    # config at the session folder, live and repos go in its
+    # .spade/guard/<session>/; without one, in each recorded child's, and
+    # nothing is written into the session folder. A list that already exists
+    # (compact, resume, clear) is left alone, so a repository created
+    # mid-session never joins it.
+    list=""
+    [ "$root_config" = yes ] && list="$project_dir"
+    if [ -n "$children" ]; then list="${list:+$list$nl}$children"; fi
+    [ -n "$list" ] || return 0
+    if [ "$root_config" = yes ]; then
+        targets="$project_dir"
+    else
+        targets="$children"
+    fi
+    while IFS= read -r target; do
+        [ -n "$target" ] || continue
+        [ -f "$target/.spade/guard/$sid/repos" ] && return 0
+    done <<EOF
+$targets
+EOF
+    stamp=$(date -u '+%Y-%m-%dT%H:%M:%SZ')
+    while IFS= read -r target; do
+        [ -n "$target" ] || continue
+        mkdir -p "$target/.spade/guard/$sid"
+        printf '%s\n' "$stamp" > "$target/.spade/guard/$sid/live"
+        printf '%s\n' "$list" > "$target/.spade/guard/$sid/repos"
+    done <<EOF
+$targets
+EOF
+}
+
+load_repos() {
+    # PreToolUse. Sets repos to the recorded session repositories, one per
+    # line, and repos_tampered to yes when the child copies of the list
+    # disagree. With a config at the session folder the list is read there,
+    # and that folder always counts, as it did when it was the only project.
+    # Without one, every copy in a child_repos entry is read; a child with no
+    # copy, such as a worktree added mid-session, is ignored. An entry counts
+    # only when it is the session folder or below it and holds .spade/config.
+    repos=""; repos_tampered=""
+    raw=""
+    if [ "$root_config" = yes ]; then
+        raw="$project_dir"
+        [ -f "$session_dir/repos" ] && raw="$raw$nl$(cat "$session_dir/repos")"
+    else
+        seen=no
+        while IFS= read -r child; do
+            [ -n "$child" ] && [ -f "$child/.spade/guard/$sid/repos" ] || continue
+            copy=$(cat "$child/.spade/guard/$sid/repos")
+            if [ "$seen" = no ]; then
+                raw="$copy"; first="$copy"; seen=yes
+            elif [ "$copy" != "$first" ]; then
+                repos_tampered=yes; raw="$raw$nl$copy"
+            fi
+        done <<EOF
+$children
+EOF
+    fi
+    while IFS= read -r entry; do
+        case "$entry" in /*) ;; *) continue ;; esac
+        [ "$(normalize_abs "$entry")" = "$entry" ] || continue
+        case "$entry" in "$project_dir"|"$project_dir"/*) ;; *) continue ;; esac
+        [ -f "$entry/.spade/config" ] || continue
+        case "$nl$repos$nl" in *"$nl$entry$nl"*) continue ;; esac
+        repos="${repos:+$repos$nl}$entry"
+    done <<EOF
+$raw
+EOF
+}
+
+repo_mode() {
+    # Arguments: recorded repository. Prints quick or deliver when that
+    # repository's own .spade/guard/<session>/mode arms it, or nothing.
+    # A mode file anywhere else, such as a decoy in a subfolder, never counts.
+    [ -f "$1/.spade/guard/$sid/mode" ] || return 0
+    armed=$(head -n 1 "$1/.spade/guard/$sid/mode" | tr -d '[:space:]')
+    case "$armed" in quick|deliver) printf '%s\n' "$armed" ;; esac
+}
+
+drop_session_markers() {
+    # SessionEnd. Removes this session's directory from the session folder and
+    # from every recorded or candidate child repository.
+    [ -n "$session" ] || return 0
+    load_repos
+    rm -rf "$session_dir"
+    while IFS= read -r target; do
+        [ -n "$target" ] || continue
+        rm -rf "$target/.spade/guard/$sid"
+    done <<EOF
+$repos
+$children
+EOF
 }
 
 config_value() {
@@ -67,23 +218,6 @@ is_true() {
     esac
 }
 
-normalize_abs() {
-    # Arguments: absolute path. Prints it lexically normalized: no empty or `.`
-    # segments, every `..` resolved against the segment before it.
-    old_ifs="$IFS"; IFS='/'
-    set -- $1
-    IFS="$old_ifs"
-    normalized=""
-    for segment in "$@"; do
-        case "$segment" in
-            ""|.) ;;
-            ..) normalized="${normalized%/*}" ;;
-            *) normalized="$normalized/$segment" ;;
-        esac
-    done
-    printf '%s\n' "${normalized:-/}"
-}
-
 relative_path() {
     # Arguments: absolute or relative path. Prints it normalized and relative to
     # the project root, so `a/../.spade/config` and
@@ -98,8 +232,6 @@ relative_path() {
         *) printf '../%s\n' "${path#/}" ;;
     esac
 }
-
-project_dir=$(normalize_abs "$project_dir")
 
 path_words() {
     # Arguments: project-relative path. Prints its words, lowercased, separated
@@ -589,17 +721,34 @@ guard_merge() {
 
 case "$event" in
     SessionStart)
-        mkdir -p "$session_dir"
-        date -u '+%Y-%m-%dT%H:%M:%SZ' > "$session_dir/live"
+        record_repos
         exit 0
         ;;
     SessionEnd)
-        [ -n "$session" ] && rm -rf "$session_dir"
+        drop_session_markers
         exit 0
         ;;
     PreToolUse) ;;
     *) exit 0 ;;
 esac
+
+load_repos
+if [ "$repos_tampered" = yes ]; then
+    tampered="SPADE guard: the copies of this session's repository list (.spade/guard/$sid/repos) disagree, so the guard cannot tell which repository a call targets. A human checks them."
+    case "$tool" in
+        Bash)
+            command=$(printf '%s' "$input" | jq -r '.tool_input.command // ""')
+            [ -z "$(printf '%s' "$command" | normalized_segments | merge_segment)" ] || deny "$tampered" ;;
+        Edit|Write|MultiEdit|NotebookEdit)
+            while IFS= read -r target; do
+                [ -n "$target" ] && [ -n "$(repo_mode "$target")" ] && deny "$tampered"
+            done <<EOF
+$repos
+EOF
+            ;;
+    esac
+fi
+[ "$root_config" = yes ] || exit 0
 
 case "$tool" in
     Edit|Write|MultiEdit|NotebookEdit)
