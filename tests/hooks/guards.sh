@@ -931,6 +931,20 @@ check "single repository, unknown directory, gh ran in the project" only_ran_in 
 expect_allow "single repository, a command before the merge" "$(green_merge "$project" "git fetch origin && gh pr merge 41 $pin")"
 expect_allow "single repository, a comment before the merge" "$(green_merge "$project" "# note; cd x &&${nl}gh pr merge 41 $pin")"
 
+# gh and git aimed elsewhere by the environment are denied like -R.
+for env_form in "cd web && GH_HOST=evil.example gh pr merge 41 $pin" \
+                "cd web && GIT_DIR=$rs/api/.git gh pr merge 41 $pin" \
+                "cd web && GIT_WORK_TREE=$rs/api gh pr merge 41 $pin" \
+                "cd web && env GH_HOST=evil.example gh pr merge 41 $pin"; do
+    expect_deny_reason "aimed elsewhere: $env_form" "drop -R, --repo, GH_REPO, or a PR URL" "$(green_merge "$rs" "$env_form")"
+done
+expect_deny "aimed elsewhere: an exported GIT_DIR before the merge" "$(green_merge "$rs" "cd web && export GIT_DIR=$rs/api/.git && gh pr merge 41 $pin")"
+expect_deny_reason "single repository, GH_HOST prefix" "drop -R, --repo, GH_REPO, or a PR URL" "$(green_merge "$project" "GH_HOST=evil.example gh pr merge 41 $pin")"
+expect_deny_reason "single repository, exported GH_HOST" "drop -R, --repo, GH_REPO, or a PR URL" "$(green_merge "$project" "export GH_HOST=evil.example; gh pr merge 41 $pin")"
+expect_deny_reason "single repository, GH_HOST set by printf -v and exported" "drop -R, --repo, GH_REPO, or a PR URL" "$(green_merge "$project" "printf -v GH_HOST %s evil.example; export GH_HOST; gh pr merge 41 $pin")"
+expect_allow "single repository, an unrelated environment prefix, the everyday form" "$(green_merge "$project" "GH_PROMPT_DISABLED=1 gh pr merge 41 $pin")"
+expect_allow "an unrelated environment prefix, the everyday form" "$(green_merge "$rs" "cd web && GH_PROMPT_DISABLED=1 gh pr merge 41 $pin")"
+
 # A deny names only a config it used: a stage-all check that read a config
 # and passed leaves no suffix on a later merge deny.
 pz="$tmp/pz"
