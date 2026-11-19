@@ -1025,13 +1025,17 @@ ln -s "$og/legacy" "$tmp/og-out/l3"
 expect_deny_reason "a symlink outside the session folder into a recorded repository" "working directory is unknown" "$(green_merge "$og" "cd $tmp/og-out/l3 && gh pr merge 41 $pin")"
 expect_allow "the on-green parent's own merge, the everyday form" "$(green_merge "$og" "cd $og && gh pr merge 41 $pin")"
 
-# Unsetting GH_HOST or GIT_DIR is the remedy the deny suggests, so it merges.
-for unset_form in "unset GIT_DIR GH_HOST && gh pr merge 41 $pin" \
-                  "env -u GIT_DIR gh pr merge 41 $pin" \
-                  "env -u GIT_DIR -u GH_HOST gh pr merge 41 $pin"; do
-    expect_allow "single repository, $unset_form" "$(green_merge "$project" "$unset_form")"
-done
-for set_form in "read GH_HOST; gh pr merge 41 $pin" \
+# Any mention of GH_REPO, GH_HOST, GIT_DIR or GIT_WORK_TREE in a merge command
+# denies, even one that clears it: a positional `unset` / `env -u` exemption
+# was forgeable (`export env -u GH_REPO; …`, a continued `unset` line).
+for set_form in "unset GIT_DIR GH_HOST && gh pr merge 41 $pin" \
+                "env -u GIT_DIR gh pr merge 41 $pin" \
+                "env -u GIT_DIR -u GH_HOST gh pr merge 41 $pin" \
+                "export env -u GH_REPO; : \${GH_REPO:=o/r}; gh pr merge 41 $pin" \
+                "read -r \\
+unset GH_HOST <<< \"a evil.example\"; export \\
+unset GH_HOST; gh pr merge 41 $pin" \
+                "read GH_HOST; gh pr merge 41 $pin" \
                 "env -u GIT_DIR GH_HOST=evil.example gh pr merge 41 $pin" \
                 "unset GIT_DIR; export GH_HOST; gh pr merge 41 $pin" \
                 "GH_HOST+=x gh pr merge 41 $pin" \

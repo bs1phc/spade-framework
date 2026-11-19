@@ -488,8 +488,10 @@ normalized_segments() {
     # - a backtick inside double quotes, a substitution the shell runs
     # - a backslash inside double quotes, which the shell keeps before most
     #   characters, so `"a/\../b"` is not `a/../b`
-    # The command matchers look through the mark (guard_awk_lib), so it never
-    # hides a stage-all or a merge.
+    # The command matchers look through the mark (guard_awk_lib), so a marked
+    # word with no escape inside (`git add $'-A'`) is still matched. The guard
+    # does not decode escapes, so `$'\x2dA'` is not recognised as `-A`; that
+    # gap predates the mark (Lead PS-3308).
     awk '
         function tok(cur, quoted, opaque) {
             return (opaque || (quoted && substr(cur, 1, 1) == "~")) ? "\003" cur : cur
@@ -1078,23 +1080,15 @@ guard_merge() {
     # URL, the environment can aim gh elsewhere: GH_REPO and GH_HOST name
     # another repository or host, and GIT_DIR or GIT_WORK_TREE another
     # checkout. An assignment anywhere in the command counts, and so does the
-    # bare name, which export, read, or printf -v can set; only `unset NAME`
-    # and `env -u NAME`, which clear it, leave a bare name alone.
+    # bare name, which export, read, or printf -v can set. There is no
+    # exemption for `unset` or `env -u`: a positional one was forgeable, and
+    # failing closed on a rare remedy costs little.
     elsewhere=$(printf '%s' "$segments" | awk -F'\t' "$guard_awk_lib"'
-        function env_unsets(k,   e, m) {
-            # Field k is NAME in `env -u NAME`, with env followed only by -u pairs.
-            for (e = 2; e < k; e++) if (w(e) == "env") break
-            for (m = e + 1; m < k; m += 2) {
-                if (w(m) != "-u") return 0
-                if (m + 1 == k) return 1
-            }
-            return 0
-        }
         {
             for (k = 2; k <= NF; k++) {
                 t = w(k)
                 if (t == "-R" || t == "--repo" || t ~ /^(-R|--repo=)./ || t ~ /^(GH_REPO|GH_HOST|GIT_DIR|GIT_WORK_TREE)\+?=/ || t ~ /\/pull\//) { print "yes"; exit }
-                if (t ~ /^(GH_REPO|GH_HOST|GIT_DIR|GIT_WORK_TREE)$/ && w(2) != "unset" && !env_unsets(k)) { print "yes"; exit }
+                if (t ~ /^(GH_REPO|GH_HOST|GIT_DIR|GIT_WORK_TREE)$/) { print "yes"; exit }
             }
         }
     ')
