@@ -26,9 +26,13 @@ tab=$(printf '\t')
 
 normalize_abs() {
     # Arguments: absolute path. Prints it lexically normalized: no empty or `.`
-    # segments, every `..` resolved against the segment before it.
+    # segments, every `..` resolved against the segment before it. Globbing is
+    # off for the split, so a `*` component stays one literal segment instead
+    # of expanding against the guard's own working directory.
     old_ifs="$IFS"; IFS='/'
+    set -f
     set -- $1
+    set +f
     IFS="$old_ifs"
     normalized=""
     for segment in "$@"; do

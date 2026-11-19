@@ -637,6 +637,11 @@ green_merge() {
     # guard's decision with gh reporting the given PR state (default green).
     GH_STUB_VIEW="${3:-$green}" run_bash "$1" "$2"
 }
+green_merge_at() {
+    # Arguments: session folder, command, hook cwd. Prints the guard's
+    # decision for a green PR with the merge run from that cwd.
+    GH_STUB_VIEW="$green" run_bash "$1" "$2" "$3"
+}
 failing='{"isDraft":false,"mergeable":"MERGEABLE","headRefOid":"abc123","changedFiles":1,"statusCheckRollup":[{"conclusion":"FAILURE"}]}'
 
 # AC 2: a parent session with no merge policy merges a child PR under the
@@ -854,6 +859,18 @@ check "reviewed-head location: the session folder, not the git top level" test "
 printf 'abc123 PASS\n' > "$(session_repo_for "$mono/sub/pkg")/.spade/guard/reviewed-head-41"
 expect_allow "the guard reads reviewed-head where the skill rule wrote it" "$(green_merge "$mono/sub" "gh pr merge 41 $pin" "$green" )"
 check "reviewed-head location: a listed child for a merge run in it" test "$(session_repo_for "$pn/a/src")" = "$pn/a"
+
+# Delivery Review findings (PS-3305). Each evasion first, then the everyday
+# form it must leave alone.
+echo "delivery review findings"
+
+# Path normalisation never glob-expands a component against the guard's cwd.
+mkdir -p "$tmp/globcwd/a" "$tmp/globcwd/b"
+set_mode deliver
+expect_deny "deliver, a glob component before .. to .spade/config" "$(cd "$tmp/globcwd" && run_guard "$(pre_tool Write "{\"file_path\":\"$project/*/../.spade/config\"}")")"
+expect_deny "deliver, a glob component escaping the project" "$(cd "$tmp/globcwd" && run_guard "$(pre_tool Write "{\"file_path\":\"$project/*/../../outside.txt\"}")")"
+expect_allow "deliver, a literal * in a safe file name" "$(cd "$tmp/globcwd" && run_guard "$(pre_tool Write "{\"file_path\":\"$project/docs/*.md\"}")")"
+clear_mode
 
 # SessionEnd removes the session's markers wherever they were written.
 guard_at "$pn" "$(session_event SessionEnd)" >/dev/null
