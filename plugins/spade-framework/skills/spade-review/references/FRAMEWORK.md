@@ -328,11 +328,12 @@ Copies of the list that disagree deny merges and armed edits.
 An edit targets its file.
 A Bash command targets its working directory, which the guard reads from an allow-list.
 It is the hook input's `cwd`, moved only by a run of commands at the very start of the input, each exactly `cd [-L|--] <literal path>` and joined to the next by `&&`; for stage-all, `git -C <literal path>` also moves it.
-A literal path has no `$`, glob or brace character, redirection, comment, substitution, quoted or escaped `~`, or `~user`.
+A literal path has no `$`, glob or brace character, redirection, comment, substitution, backtick, backslash, quoted or escaped `~`, or `~user`, and no `$'…'` or `$"…"` quoting.
 An unquoted `~` or `~/…` expands to `$HOME` unless the command names `HOME` earlier, and a relative path resolves against the directory so far unless the guard's own `CDPATH` is set.
 A newline ends a command the way `;` does.
 Anything else before the checked command makes the directory unknown, whatever it is: any other command, a comment, a heredoc, a subshell, a brace group, a substitution, or a joiner other than `&&`.
-So does a folder below the repository root that is a symbolic link, a word in front of the checked command that can move it (a variable, `cd`, `chdir`, `pushd`, `popd`, `eval`, `source`, `trap`), `env -C`, and for stage-all `--git-dir`, `--work-tree`, `GIT_DIR`, or `GIT_WORK_TREE`.
+The words in front of the checked command are an allow-list too. Only literal `NAME=value` assignments, `command`, `time`, `env` and `nice` (alone or with a numeric `-n`) may come before it. Any other word makes the directory unknown, which covers `sudo`, `xargs`, `find -execdir`, `pnpm -C` and `env -C`. For stage-all, `git -C <literal path>` sets the directory, and `--git-dir`, `--work-tree`, `GIT_DIR` or `GIT_WORK_TREE` make it unknown.
+The guard resolves the folder physically, following symbolic links the way the shell and git do. It is unknown when it doesn't exist, or when its physical repository differs from the lexical one.
 In a single-repository session, where the recorded list is just the session folder, an unknown directory is the session folder, as before; otherwise it denies a merge, and denies a stage-all when any session repository sets `deny_stage_all`.
 When the target is outside every session repository, the session folder's config applies if it has one.
 Without one, such a merge denies, and such a stage-all is not checked.
